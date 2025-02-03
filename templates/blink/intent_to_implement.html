@@ -1,31 +1,3 @@
-<p>Email to</p>
-<div class="subject">
-  blink-dev@chromium.org
-</div>
-
-<p>Subject</p>
-<div class="subject">
-  {{subject_prefix}}:
-  {{feature.name}}
-</div>
-
-{#
-  Insted of vertical margins, <br> elements are used to create line breaks
-  that can be copied and pasted into a text editor.
-#}
-
-<p>Body
-  <span class="tooltip copy-text" style="float:right"
-        title="Copy text to clipboard">
-      <a href="#" data-tooltip>
-        <iron-icon icon="chromestatus:content_copy"
-                   id="copy-email-body"></iron-icon>
-      </a>
-  </span>
-</p>
-
-<div class="email">
-
   <h4>Contact emails</h4>
   {% if not feature.browsers.chrome.owners %}None{% endif %}
   {% for owner in feature.browsers.chrome.owners %}
@@ -55,7 +27,7 @@
 
   <br><br><h4>Blink component</h4>
   {% for c in feature.browsers.chrome.blink_components %}
-    <a href="https://bugs.chromium.org/p/chromium/issues/list?q=component:{{c}}" target="_blank" rel="noopener">{{c}}</a>
+    <a href="https://issues.chromium.org/issues?q=customfield1222907:%22{{c}}%22" target="_blank" rel="noopener">{{c}}</a>
   {% endfor %}
 
   {% if 'motivation' in sections_to_show %}
@@ -82,11 +54,29 @@
     {{feature.tag_review_status}}
   {% endif %}
 
-  {% if feature.origin_trial_feedback_url %}
-    <br><br><h4>Link to origin trial feedback summary</h4>
-    {{feature.origin_trial_feedback_url}}
-  {% endif %}
+  {% for stage in stage_info.ot_stages %}
+    {% if stage.ot_display_name %}
+      <br><br><h4>Origin Trial Name</h4>
+      {{stage.ot_display_name}}
 
+    {% endif %}{% if stage.ot_chromium_trial_name %}
+      <br><br><h4>Chromium Trial Name</h4>
+      {{stage.ot_chromium_trial_name}}
+
+    {% endif %}{% if stage.origin_trial_feedback_url %}
+      <br><br><h4>Link to origin trial feedback summary</h4>
+      {{stage.origin_trial_feedback_url}}
+
+    {% endif %}{% if stage.ot_documentation_url %}
+      <br><br><h4>Origin Trial documentation link</h4>
+      {{stage.ot_documentation_url}}
+
+    {% endif %}{% if stage.ot_webfeature_use_counter %}
+      <br><br><h4>WebFeature UseCounter name</h4>
+      {{stage.ot_webfeature_use_counter}}
+
+    {% endif %}
+  {% endfor %}
   <br><br><h4>Risks</h4>
   <div style="margin-left: 4em;">
     <br><br><h4>Interoperability and Compatibility</h4>
@@ -156,8 +146,12 @@
   {% endif %}
 
   {% if 'extension_reason' in sections_to_show %}
-    <br><br><h4>Reason this experiment is being extended</h4>
-    <p class="preformatted">{{feature.experiment_extension_reason|urlize}}</p>
+    {% for stage in stage_info.extension_stages %}
+      {% if stage.experiment_extension_reason %}
+        <br><br><h4>Reason this experiment is being extended</h4>
+        <p class="preformatted">{{stage.experiment_extension_reason|urlize}}</p>
+      {% endif %}
+    {% endfor %}
   {% endif %}
 
   <br><br><h4>Ongoing technical constraints</h4>
@@ -170,7 +164,7 @@
 
 {% if 'experiment' in sections_to_show or 'ship' in sections_to_show %}
   <br><br><h4>Will this feature be supported on all six Blink platforms
-      (Windows, Mac, Linux, Chrome OS, Android, and Android WebView)?</h4>
+      (Windows, Mac, Linux, ChromeOS, Android, and Android WebView)?</h4>
   {% if feature.all_platforms %}Yes{% else %}No{% endif %}
   {% if feature.all_platforms_descr %}
     <p class="preformatted">{{feature.all_platforms_descr|urlize}}</p>
@@ -179,7 +173,7 @@
 
 <br><br><h4>Is this feature fully tested by <a href="https://chromium.googlesource.com/chromium/src/+/main/docs/testing/web_platform_tests.md">web-platform-tests</a>?</h4>
 {% if feature.wpt %}Yes{% else %}No{% endif %}
-{% if feature.wpt_desc %}
+{% if feature.wpt_descr %}
   <p class="preformatted">{{feature.wpt_descr|urlize}}</p>
 {% endif %}
 
@@ -189,8 +183,23 @@
      >{{feature.devtrial_instructions}}</a>
 {% endif %}
 
-<br><br><h4>Flag name</h4>
+<br><br><h4>Flag name on about://flags</h4>
 {{feature.flag_name}}
+
+<br><br><h4>Finch feature name</h4>
+{{feature.finch_name}}
+
+{% if feature.non_finch_justification %}
+  <br><br><h4>Non-finch justification</h4>
+  <p class="preformatted">{{feature.non_finch_justification|urlize}}</p>
+{% else %}
+  {% if not feature.finch_name %}
+    <br><br><h4>Non-finch justification</h4>
+    None
+  {% endif %}
+{% endif %}
+
+
 
 <br><br><h4>Requires code in //chrome?</h4>
 {{feature.requires_embedder_support}}
@@ -208,6 +217,21 @@
 {% if feature.measurement %}
   <br><br><h4>Measurement</h4>
   {{feature.measurement|urlize}}
+{% endif %}
+
+{% if feature.availability_expectation %}
+  <br><br><h4>Availability expectation</h4>
+  {{feature.availability_expectation|urlize}}
+{% endif %}
+
+{% if feature.adoption_expectation %}
+  <br><br><h4>Adoption expectation</h4>
+  {{feature.adoption_expectation|urlize}}
+{% endif %}
+
+{% if feature.adoption_plan %}
+  <br><br><h4>Adoption plan</h4>
+  {{feature.adoption_plan|urlize}}
 {% endif %}
 
 {% if feature.non_oss_deps %}
@@ -251,40 +275,38 @@
 <a href="{{default_url}}">{{default_url}}</a>
 
 
-{% if feature.intent_to_implement_url or feature.ready_for_trial_url or feature.intent_to_experiment_url or feature.intent_to_extend_experiment_url or feature.intent_to_ship_url %}
+{% if should_render_intents %}
   <br><br><h4>Links to previous Intent discussions</h4>
 
-  {% if feature.intent_to_implement_url %}
-    Intent to prototype: {{feature.intent_to_implement_url|urlize}}
-    <br>
-  {% endif %}
+  {% for stage in stage_info.proto_stages %}{% if stage.intent_thread_url %}
+      Intent to Prototype: {{stage.intent_thread_url|urlize}}
+      <br>
 
-  {% if feature.ready_for_trial_url %}
-    Ready for Trial: {{feature.ready_for_trial_url|urlize}}
-    <br>
-  {% endif %}
+  {% endif %}{% endfor %}
+  {% for stage in stage_info.dt_stages %}{% if stage.announcement_url %}
+      Ready for Trial: {{stage.announcement_url|urlize}}
+      <br>
 
-  {% if feature.intent_to_experiment_url %}
-    Intent to Experiment: {{feature.intent_to_experiment_url|urlize}}
-    <br>
-  {% endif %}
+  {% endif %}{% endfor %}
+  {% for stage in stage_info.ot_stages %}{% if stage.intent_thread_url %}
+      Intent to Experiment: {{stage.intent_thread_url|urlize}}
+      <br>
 
-  {% if feature.intent_to_extend_experiment_url %}
-    Intent to Extend Experiment: {{feature.intent_to_extend_experiment_url|urlize}}
-    <br>
-  {% endif %}
+  {% endif %}{% endfor %}
+  {% for stage in stage_info.extension_stages %}
+    {% if stage.intent_thread_url %}
+      Intent to Extend Experiment {{loop.index}}: {{stage.intent_thread_url|urlize}}
+      <br>
 
-  {% if feature.intent_to_ship_url %}
-    Intent to Ship: {{feature.intent_to_ship_url|urlize}}
-    <br>
-  {% endif %}
+  {% endif %}{% endfor %}
+  {% for stage in stage_info.ship_stages %}{% if stage.intent_thread_url %}
+      Intent to Ship: {{stage.intent_thread_url|urlize}}
+      <br>
+
+  {% endif %}{% endfor %}
 {% endif %}
 
-
-
-<br><br><div><small>
-  This intent message was generated by
-  <a href="https://chromestatus.com">Chrome Platform Status</a>.
-</small></div>
-
-</div> <!-- end email body div -->
+  <br><br><div><small>
+    This intent message was generated by
+    <a href="https://chromestatus.com">Chrome Platform Status</a>.
+  </small></div>

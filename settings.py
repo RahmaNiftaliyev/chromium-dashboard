@@ -1,6 +1,7 @@
 import logging
 import os
-from typing import Any, Optional
+
+from framework.secrets import get_ot_api_key
 
 
 ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -12,8 +13,12 @@ def get_flask_template_path() -> str:
 
 # By default, send all email to an archive for debugging.
 # For the live cr-status server, this setting is None.
-SEND_ALL_EMAIL_TO: Optional[str] = (
+SEND_ALL_EMAIL_TO: str|None = (
     'cr-status-staging-emails+%(user)s+%(domain)s@google.com')
+# Any emails with Cc addresses will instead be sent this group
+# for non-prod environments.
+CC_ALL_EMAIL_TO: str|None = (
+    'cr-status-staging-cc-emails+%(user)s+%(domain)s@google.com')
 
 BOUNCE_ESCALATION_ADDR = 'cr-status-bounces@google.com'
 
@@ -29,6 +34,12 @@ BANNER_TIME = None
 
 # If a feature entry does not specify a component, use this one.
 DEFAULT_COMPONENT = 'Blink'
+
+# The default component for enterprise features.
+DEFAULT_ENTERPRISE_COMPONENT = 'Enterprise'
+
+# Enable to activate the automated OT creation process
+AUTOMATED_OT_CREATION = True
 
 
 ################################################################################
@@ -61,7 +72,7 @@ GOOGLE_SIGN_IN_CLIENT_ID = (
 
 # This is where the an anon user is redirected if they try to access a
 # page that requires being signed in.
-LOGIN_PAGE_URL = '/features?loginStatus=False'
+LOGIN_PAGE_URL = '?loginStatus=False'
 
 INBOUND_EMAIL_ADDR = 'chromestatus@cr-status-staging.appspotmail.com'
 
@@ -71,21 +82,44 @@ REVIEW_COMMENT_MAILING_LIST = 'jrobbins-test@googlegroups.com'
 # Truncate some log lines to stay under limits of Google Cloud Logging.
 MAX_LOG_LINE = 200 * 1000
 
+# Largest individual attachment / screenshot that the user can POST.
+MAX_ATTACHMENT_SIZE = 1 * 1024 * 1024
+
+# Largest overall POST to any handler.
+MAX_REQUEST_CONTENT_LENGTH = 16 * 1024 * 1024
+
+# Origin trials API URL
+OT_URL = 'https://origintrials-staging.corp.google.com/origintrials/'
+OT_API_URL = 'https://staging-chromeorigintrials-pa.sandbox.googleapis.com'
+
+# Values are set later when request is needed.
+OT_API_KEY: str|None = None
+OT_DATA_ACCESS_ADMIN_GROUP_NAME: str|None = None
+
+# Dummy data for local OT support emails.
+DEV_MODE_OT_SUPPORT_EMAILS = 'user1@gmail.com,user2@gmail.com'
+
+# URL host for Webstatus.dev API endponts.
+API_WEBSTATUS_DEV_URL = 'https://api.webstatus.dev'
 
 if UNIT_TEST_MODE:
   APP_TITLE = 'Local testing'
-  SITE_URL = 'http://127.0.0.1:8888/'
+  SITE_URL = 'http://127.0.0.1:7777/'
+  API_WEBSTATUS_DEV_URL = 'https://api.server.test'
 elif DEV_MODE:
   PROD = False
   APP_TITLE = 'Chrome Status Dev'
-  SITE_URL = 'http://127.0.0.1:8888/'
+  SITE_URL = 'http://127.0.0.1:7777/'
 elif APP_ID == 'cr-status':
   PROD = True
   DEBUG = False
   APP_TITLE = 'Chrome Platform Status'
   SEND_EMAIL = True
   SEND_ALL_EMAIL_TO = None  # Deliver it to the intended users
+  CC_ALL_EMAIL_TO = None
   SITE_URL = 'https://chromestatus.com/'
+  OT_URL = 'https://developer.chrome.com/origintrials/'
+  OT_API_URL = 'https://chromeorigintrials-pa.googleapis.com'
   GOOGLE_SIGN_IN_CLIENT_ID = (
       '999517574127-7ueh2a17bv1ave9thlgtap19pt5qjp4g.'
       'apps.googleusercontent.com')

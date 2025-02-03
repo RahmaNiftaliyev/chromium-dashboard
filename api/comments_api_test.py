@@ -12,17 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import datetime
-import testing_config  # Must be imported before the module under test.
+from unittest import mock
 
 import flask
-from unittest import mock
 import werkzeug.exceptions  # Flask HTTP stuff.
+from chromestatus_openapi.models import (
+  Amendment as AmendmentModel,
+  Activity as ActivityModel,
+)
 
+import testing_config  # Must be imported before the module under test.
 from api import comments_api
-from internals import core_models
-from internals import review_models
+from internals.core_models import FeatureEntry
+from internals.review_models import Activity, Amendment, Gate, Vote
 
 test_app = flask.Flask(__name__)
 
@@ -32,32 +35,32 @@ NOW = datetime.datetime.now()
 class CommentsConvertersTest(testing_config.CustomTestCase):
 
   def test_amendment_to_json_dict(self):
-    amnd = review_models.Amendment(
+    amnd = Amendment(
         field_name='summary', old_value='foo', new_value='bar')
-    expected = dict(field_name='summary', old_value='foo', new_value='bar')
-    actual = comments_api.amendment_to_json_dict(amnd)
+    expected = AmendmentModel(field_name='summary', old_value='foo', new_value='bar')
+    actual = comments_api.amendment_to_OAM(amnd)
     self.assertEqual(expected, actual)
 
   def test_amendment_to_json_dict__arrays(self):
     """Arrays are shown without the brackets."""
-    amnd = review_models.Amendment(
+    amnd = Amendment(
         field_name='summary', old_value='[1, 2]', new_value='[1, 2, 3]')
-    expected = dict(field_name='summary', old_value='1, 2', new_value='1, 2, 3')
-    actual = comments_api.amendment_to_json_dict(amnd)
+    expected = AmendmentModel(field_name='summary', old_value='1, 2', new_value='1, 2, 3')
+    actual = comments_api.amendment_to_OAM(amnd)
     self.assertEqual(expected, actual)
 
   def test_activity_to_json_dict(self):
-    amnd_1 = review_models.Amendment(
+    amnd_1 = Amendment(
         field_name='summary', old_value='foo', new_value='bar')
-    amnd_2 = review_models.Amendment(
+    amnd_2 = Amendment(
         field_name='owner_emails', old_value='None', new_value='[]')
     created = datetime.datetime(2022, 10, 28, 0, 0, 0)
-    act = review_models.Activity(
+    act = Activity(
         id=1, feature_id=123, gate_id=456, created=created,
         author='author@example.com', content='hello',
         amendments=[amnd_1, amnd_2])
-    actual = comments_api.activity_to_json_dict(act)
-    expected = {
+    actual = comments_api.activity_to_OAM(act)
+    expected_dict = {
       'comment_id': 1,
       'feature_id': 123,
       'gate_id': 456,
@@ -71,19 +74,20 @@ class CommentsConvertersTest(testing_config.CustomTestCase):
           'new_value': 'bar',
       }],
     }
+    expected = ActivityModel.from_dict(expected_dict)
     self.assertEqual(expected, actual)
 
 
 class CommentsAPITest(testing_config.CustomTestCase):
 
   def setUp(self):
-    self.feature_1 = core_models.FeatureEntry(
+    self.feature_1 = FeatureEntry(
         name='feature one', summary='sum', category=1)
     self.feature_1.put()
     self.feature_id = self.feature_1.key.integer_id()
 
-    self.gate_1 = review_models.Gate(feature_id=self.feature_id,
-        stage_id=1, gate_type=2, state=review_models.Vote.NA)
+    self.gate_1 = Gate(feature_id=self.feature_id,
+        stage_id=1, gate_type=2, state=Vote.NA)
     self.gate_1.put()
     self.gate_1_id = self.gate_1.key.integer_id()
 
@@ -91,7 +95,7 @@ class CommentsAPITest(testing_config.CustomTestCase):
     self.request_path = ('/api/v0/features/%d/approvals/%d/comments' %
                          (self.feature_id, self.gate_1_id))
 
-    self.act_1_1 = review_models.Activity(
+    self.act_1_1 = Activity(
       feature_id=self.feature_id, gate_id=self.gate_1_id,
       author='owner1@example.com', created=NOW, content='Good job')
 
@@ -106,9 +110,7 @@ class CommentsAPITest(testing_config.CustomTestCase):
 
   def tearDown(self):
     self.feature_1.key.delete()
-    for appr in review_models.Approval.query():
-      appr.key.delete()
-    for activity in review_models.Activity.query():
+    for activity in Activity.query():
       activity.key.delete()
 
   def test_get__empty(self):
@@ -122,21 +124,20 @@ class CommentsAPITest(testing_config.CustomTestCase):
     self.assertEqual({'comments': []}, actual_response)
 
   def test_get__legacy_comments(self):
-    """We can get legacy comments."""
+    """We no longer return legacy gate comments when gate_id is specified."""
     testing_config.sign_out()
     testing_config.sign_in('user7@example.com', 123567890)
 
-    legacy_comment = review_models.Activity(
+    legacy_comment = Activity(
       feature_id=self.feature_id, author='owner1@example.com',
-      created=NOW, content='nothing')
+      created=NOW, content='nothing')  # no gate_id
     legacy_comment.put()
 
     with test_app.test_request_context(self.request_path):
       actual_response = self.handler.do_get(
           feature_id=self.feature_id, gate_id=self.gate_1_id)
     testing_config.sign_out()
-    actual_comment = actual_response['comments'][0]
-    self.assertEqual('nothing', actual_comment['content'])
+    self.assertEqual([], actual_response['comments'])
 
   def test_get__all_some(self):
     """We can get all comments for a given approval."""
@@ -144,7 +145,7 @@ class CommentsAPITest(testing_config.CustomTestCase):
     testing_config.sign_in('user7@example.com', 123567890)
     self.act_1_1.put()
 
-    random_activity = review_models.Activity(
+    random_activity = Activity(
       feature_id=self.feature_id, gate_id=99,
       author='owner1@example.com', created=NOW, content='nothing')
     random_activity.put()
@@ -228,7 +229,7 @@ class CommentsAPITest(testing_config.CustomTestCase):
     self.assertEqual(resp, {'message': 'Done'})
 
     # Check activity is also deleted.
-    activity = review_models.Activity.get_by_id(self.act_1_1.key.integer_id())
+    activity = Activity.get_by_id(self.act_1_1.key.integer_id())
     self.assertIsNotNone(activity)
     self.assertEqual(activity.deleted_by, user_email)
 
@@ -249,12 +250,13 @@ class CommentsAPITest(testing_config.CustomTestCase):
     self.assertEqual(resp, {'message': 'Done'})
 
     # Check activity is also undeleted.
-    activity = review_models.Activity.get_by_id(self.act_1_1.key.integer_id())
+    activity = Activity.get_by_id(self.act_1_1.key.integer_id())
     self.assertIsNotNone(activity)
     self.assertIsNone(activity.deleted_by)
 
+  @mock.patch('internals.notifier_helpers.notify_subscribers_of_new_comments')
   @mock.patch('internals.approval_defs.get_approvers')
-  def test_post__comment_only(self, mock_get_approvers):
+  def test_post__comment_only(self, mock_get_approvers, mock_notifier):
     """Handler adds a comment only, does not require approval permission."""
     mock_get_approvers.return_value = []
     testing_config.sign_in('user2@chromium.org', 123567890)
@@ -264,14 +266,14 @@ class CommentsAPITest(testing_config.CustomTestCase):
           gate_id=self.gate_1_id)
 
     self.assertEqual(actual, {'message': 'Done'})
-    updated_comments = review_models.Activity.get_activities(
+    updated_comments = Activity.get_activities(
         self.feature_id, self.gate_1.key.integer_id(), comments_only=True)
     cmnt = updated_comments[0]
     self.assertEqual('Congratulations', cmnt.content)
     self.assertEqual('user2@chromium.org', cmnt.author)
 
     # Check activity is also created.
-    activity = review_models.Activity.get_by_id(cmnt.key.integer_id())
+    activity = Activity.get_by_id(cmnt.key.integer_id())
     self.assertIsNotNone(activity)
 
   @mock.patch('internals.approval_defs.get_approvers')

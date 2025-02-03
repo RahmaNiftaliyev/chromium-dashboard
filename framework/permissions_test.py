@@ -31,6 +31,10 @@ class MockHandler(basehandlers.BaseHandler):
 
   def __init__(self):
     self.called_with = None
+    self.common_data = {}
+
+  def get_common_data(self):
+    return self.common_data
 
   @permissions.require_admin_site
   def do_get(self, *args):
@@ -47,7 +51,6 @@ test_app = basehandlers.FlaskApplication(
     __name__,
     [Route('/path', MockHandler),
      ],
-    [], # POST routes
     debug=True)
 
 
@@ -91,10 +94,22 @@ class PermissionFunctionTests(testing_config.CustomTestCase):
     self.feature_1.put()
     self.feature_id = self.feature_1.key.integer_id()
 
+    # Feature for checking permissions against
+    self.feature_confidential = core_models.FeatureEntry(
+        name='feature one', summary='sum',
+        creator_email="feature_creator@example.com",
+        owner_emails=['feature_owner@example.com'],
+        editor_emails=['feature_editor@example.com'],
+        spec_mentor_emails=['mentor@example.com'], category=1,
+        confidential=True)
+    self.feature_confidential.put()
+    self.feature_confidential_id = self.feature_confidential.key.integer_id()
+
   def tearDown(self):
     for user in self.users:
       user.delete()
     self.feature_1.key.delete()
+    self.feature_confidential.key.delete()
 
   def check_function_results(
       self, func, additional_args,
@@ -191,14 +206,21 @@ class PermissionFunctionTests(testing_config.CustomTestCase):
   def test_can_view_feature(self):
     self.check_function_results(
         permissions.can_view_feature, (None,),
-        unregistered=True, registered=True,
-        special=True, site_editor=True, admin=True, anon=True)
+        unregistered=False, registered=False,
+        special=False, site_editor=False, admin=False, anon=False)
 
     self.check_function_results_with_feature(
-      permissions.can_view_feature, (self.feature_id,),
+      permissions.can_view_feature, (self.feature_1,),
       unregistered=True, registered=True,
       feature_owner=True, feature_editor=True,
       creator=True, site_editor=True, admin=True, spec_mentor=True,
+    )
+
+    self.check_function_results_with_feature(
+      permissions.can_view_feature, (self.feature_confidential,),
+      unregistered=False, registered=False,
+      feature_owner=True, feature_editor=True,
+      creator=True, site_editor=False, admin=True, spec_mentor=False,
     )
 
   def test_can_create_feature(self):
@@ -227,19 +249,31 @@ class PermissionFunctionTests(testing_config.CustomTestCase):
       creator=True, site_editor=True, admin=True, spec_mentor=True
     )
 
-  def test_can_approve_feature(self):
+  def test_can_review_gate(self):
     approvers = []
     self.check_function_results(
-        permissions.can_approve_feature, (None, approvers),
+        permissions.can_review_gate, (self.feature_1, None, approvers),
         unregistered=False, registered=False,
         special=False, site_editor=False, admin=True, anon=False)
 
     approvers = ['registered@example.com']
     self.check_function_results(
-        permissions.can_approve_feature, (None, approvers),
+        permissions.can_review_gate, (self.feature_1, None, approvers),
         unregistered=False, registered=True,
         special=False, site_editor=False, admin=True, anon=False)
 
+  def test_can_view_enterprise_release_notes(self):
+    # Test non google or chromium user
+    testing_config.sign_in('user@example.com', 123)
+    self.assertEqual(False, permissions.is_google_or_chromium_account(users.get_current_user()))
+
+    # Test google user
+    testing_config.sign_in('user@google.com', 123)
+    self.assertEqual(True, permissions.is_google_or_chromium_account(users.get_current_user()))
+
+    # Test chromium user
+    testing_config.sign_in('user@chromium.org', 123)
+    self.assertEqual(True, permissions.is_google_or_chromium_account(users.get_current_user()))
 
 class RequireAdminSiteTests(testing_config.CustomTestCase):
 

@@ -18,6 +18,8 @@
 import os
 import pickle
 import logging
+from typing import Optional
+
 import settings
 
 import redis
@@ -26,7 +28,7 @@ import fakeredis
 from redis.retry import Retry
 from redis.backoff import ExponentialBackoff
 
-redis_client = None
+redis_client: Optional[redis.Redis] = None
 
 if settings.UNIT_TEST_MODE:
   redis_client = fakeredis.FakeStrictRedis()
@@ -121,8 +123,9 @@ def delete(key):
   redis_client.delete(cache_key)
 
 
-def delete_keys_with_prefix(pattern):
-  """Delete all keys matching a prefix pattern."""
+def delete_keys_with_prefix(prefix: str):
+  """Delete all keys matching a prefix."""
+  pattern = prefix + '|*'
   if redis_client is None:
     return
 

@@ -1,5 +1,6 @@
-runtime: python310
+runtime: python311
 service: notifier
+instance_class: F4_1G
 
 handlers:
 - url: /tasks/detect-intent
@@ -11,6 +12,10 @@ handlers:
   # Header checks prevent raw access to this handler.  Tasks have headers.
 
 - url: /tasks/email-reviewers
+  script: auto
+  # Header checks prevent raw access to this handler.  Tasks have headers.
+
+- url: /tasks/email-comments
   script: auto
   # Header checks prevent raw access to this handler.  Tasks have headers.
 

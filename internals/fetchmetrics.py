@@ -21,7 +21,7 @@ from xml.dom import minidom
 import requests
 
 from google.auth.transport import requests as reqs
-from google.oauth2 import id_token
+import google.oauth2.id_token
 
 from framework import basehandlers
 from framework import rediscache
@@ -34,7 +34,7 @@ import settings
 UMA_QUERY_SERVER = 'https://uma-export.appspot.com/chromestatus/'
 
 HISTOGRAMS_URL = 'https://chromium.googlesource.com/chromium/src/+/main/' \
-    'tools/metrics/histograms/enums.xml?format=TEXT'
+    'tools/metrics/histograms/metadata/blink/enums.xml?format=TEXT'
 
 # After we have processed all metrics data for a given kind on a given day,
 # we create a capstone entry with this otherwise unused bucket_id.  Later
@@ -50,7 +50,7 @@ def _FetchMetrics(url):
     # https://cloud.google.com/appengine/docs/python/appidentity/#asserting_identity_to_other_app_engine_apps
     # GAE request limit is 60s, but it could go longer due to start-up latency.
     logging.info('Requesting metrics from: %r', url)
-    token = id_token.fetch_id_token(reqs.Request(), url)
+    token = google.oauth2.id_token.fetch_id_token(reqs.Request(), url)
     logging.info('token is %r', token)
     return requests.request(
         'GET', url, timeout=120.0, allow_redirects=False,
@@ -219,7 +219,7 @@ class YesterdayHandler(basehandlers.FlaskHandler):
     # does a query on those datapoints and caches the result. If we don't invalidate when
     # we add datapoints, the cached query result will be lacking the new datapoints.
     # This is run once every 6 hours.
-    rediscache.delete_keys_with_prefix('metrics|*')
+    rediscache.delete_keys_with_prefix('metrics')
     return 'Success'
 
 
@@ -257,7 +257,7 @@ class HistogramsHandler(basehandlers.FlaskHandler):
 
     if (response.status_code != 200):
       logging.error('Unable to retrieve chromium histograms mapping file.')
-      return
+      self.abort(500)
 
     histograms_content = base64.b64decode(response.content).decode()
     dom = minidom.parseString(histograms_content)
@@ -267,13 +267,19 @@ class HistogramsHandler(basehandlers.FlaskHandler):
     #   <int value="0" label="OBSOLETE_PageDestruction"/>
     #   <int value="1" label="LegacyNotifications"/>
 
-    enum_tags = dom.getElementsByTagName('enum')
+    enum_els = dom.getElementsByTagName('enum')
 
     # Save bucket ids for each histogram type, FeatureObserver and
     # MappedCSSProperties.
     for histogram_id in list(self.MODEL_CLASS.keys()):
-      enum = [enum for enum in enum_tags
-              if enum.attributes['name'].value == histogram_id][0]
+      matching_els = [el for el in enum_els
+                      if el.attributes['name'].value == histogram_id]
+      if matching_els:
+        enum = matching_els[0]
+      else:
+        logging.error(f'Unable to find <enum name="{histogram_id}">.')
+        self.abort(500)
+
       for child in enum.getElementsByTagName('int'):
         self._SaveData({
           'bucket_id': child.attributes['value'].value,

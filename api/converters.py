@@ -14,20 +14,27 @@
 # limitations under the License.
 
 import datetime
-from typing import Any
+import re
+from typing import Any, Optional, TypedDict
+
 from google.cloud import ndb  # type: ignore
-from internals import stage_helpers
 
+import settings
+from internals import approval_defs, slo, self_certify
 from internals.core_enums import *
-from internals.core_models import Feature, FeatureEntry, MilestoneSet, Stage
-from internals.review_models import Vote, Gate
-from internals import approval_defs
-
+from internals.core_models import (
+  FeatureEntry,
+  MilestoneSet,
+  ReviewResultProperty,
+  Stage,
+)
+from internals.data_types import FeatureDictInnerViewInfo, StageDict, VerboseFeatureDict
+from internals.review_models import Gate, Vote
 
 SIMPLE_TYPES = frozenset((int, float, bool, dict, str, list))
 
 
-def to_dict(entity: ndb.Model) -> dict[str, Any]:
+def to_dict(entity: ndb.Model) -> dict[str, Any]: # pragma: no cover
   output = {}
   for key, prop in entity._properties.items():
     # Skip obsolete values that are still in our datastore
@@ -67,170 +74,44 @@ def del_none(d):
   return d
 
 
-def feature_to_legacy_json(f: Feature) -> dict[str, Any]:
-  d: dict[str, Any] = to_dict(f)
-  is_released = f.impl_status_chrome in RELEASE_IMPL_STATES
-  d['is_released'] = is_released
-
-  if f.is_saved():
-    d['id'] = f.key.integer_id()
-  else:
-    d['id'] = None
-  d['category'] = FEATURE_CATEGORIES[f.category]
-  d['category_int'] = f.category
-  if f.feature_type is not None:
-    d['feature_type'] = FEATURE_TYPES[f.feature_type]
-    d['feature_type_int'] = f.feature_type
-  if f.intent_stage is not None:
-    d['intent_stage'] = INTENT_STAGES[f.intent_stage]
-    d['intent_stage_int'] = f.intent_stage
-  d['created'] = {
-    'by': d.pop('created_by', None),
-    'when': d.pop('created', None),
-  }
-  d['updated'] = {
-    'by': d.pop('updated_by', None),
-    'when': d.pop('updated', None),
-  }
-  d['accurate_as_of'] = d.pop('accurate_as_of', None)
-  d['standards'] = {
-    'spec': d.pop('spec_link', None),
-    'status': {
-      'text': STANDARDIZATION[f.standardization],
-      'val': d.pop('standardization', None),
-    },
-    'maturity': {
-      'text': STANDARD_MATURITY_CHOICES.get(f.standard_maturity),
-      'short_text': STANDARD_MATURITY_SHORT.get(f.standard_maturity),
-      'val': f.standard_maturity,
-    },
-  }
-  del d['standard_maturity']
-  d['tag_review_status'] = REVIEW_STATUS_CHOICES[f.tag_review_status]
-  d['tag_review_status_int'] = f.tag_review_status
-  d['security_review_status'] = REVIEW_STATUS_CHOICES[
-      f.security_review_status]
-  d['security_review_status_int'] = f.security_review_status
-  d['privacy_review_status'] = REVIEW_STATUS_CHOICES[
-      f.privacy_review_status]
-  d['privacy_review_status_int'] = f.privacy_review_status
-  d['resources'] = {
-    'samples': d.pop('sample_links', []),
-    'docs': d.pop('doc_links', []),
-  }
-  d['tags'] = d.pop('search_tags', [])
-  d['editors'] = d.pop('editors', [])
-  d['cc_recipients'] = d.pop('cc_recipients', [])
-  d['creator'] = d.pop('creator', None)
-
-  ff_views = d.pop('ff_views', NO_PUBLIC_SIGNALS)
-  ie_views = d.pop('ie_views', NO_PUBLIC_SIGNALS)
-  safari_views = d.pop('safari_views', NO_PUBLIC_SIGNALS)
-  web_dev_views = d.pop('web_dev_views', DEV_NO_SIGNALS)
-  d['browsers'] = {
-    'chrome': {
-      'bug': d.pop('bug_url', None),
-      'blink_components': d.pop('blink_components', []),
-      'devrel': d.pop('devrel', []),
-      'owners': d.pop('owner', []),
-      'origintrial': f.impl_status_chrome == ORIGIN_TRIAL,
-      'intervention': f.impl_status_chrome == INTERVENTION,
-      'prefixed': d.pop('prefixed', False),
-      'flag': f.impl_status_chrome == BEHIND_A_FLAG,
-      'status': {
-        'text': IMPLEMENTATION_STATUS[f.impl_status_chrome],
-        'val': d.pop('impl_status_chrome', None)
-      },
-      'desktop': d.pop('shipped_milestone', None),
-      'android': d.pop('shipped_android_milestone', None),
-      'webview': d.pop('shipped_webview_milestone', None),
-      'ios': d.pop('shipped_ios_milestone', None),
-    },
-    'ff': {
-      'view': {
-        'text': VENDOR_VIEWS.get(ff_views,
-            VENDOR_VIEWS_COMMON[NO_PUBLIC_SIGNALS]),
-        'val': ff_views if ff_views in VENDOR_VIEWS else NO_PUBLIC_SIGNALS,
-        'url': d.pop('ff_views_link', None),
-        'notes': d.pop('ff_views_notes', None),
-      }
-    },
-    'edge': {  # Deprecated
-      'view': {
-        'text': VENDOR_VIEWS.get(ie_views,
-            VENDOR_VIEWS_COMMON[NO_PUBLIC_SIGNALS]),
-        'val': ie_views if ie_views in VENDOR_VIEWS else NO_PUBLIC_SIGNALS,
-        'url': d.pop('ie_views_link', None),
-        'notes': d.pop('ie_views_notes', None),
-      }
-    },
-    'safari': {
-      'view': {
-        'text': VENDOR_VIEWS.get(safari_views,
-            VENDOR_VIEWS_COMMON[NO_PUBLIC_SIGNALS]),
-        'val': (safari_views if safari_views in VENDOR_VIEWS
-            else NO_PUBLIC_SIGNALS),
-        'url': d.pop('safari_views_link', None),
-        'notes': d.pop('safari_views_notes', None),
-      }
-    },
-    'webdev': {
-      'view': {
-        'text': WEB_DEV_VIEWS.get(f.web_dev_views,
-            WEB_DEV_VIEWS[DEV_NO_SIGNALS]),
-        'val': (web_dev_views if web_dev_views in WEB_DEV_VIEWS
-            else DEV_NO_SIGNALS),
-        'url': d.pop('web_dev_views_link', None),
-        'notes': d.pop('web_dev_views_notes', None),
-      }
-    },
-    'other': {
-      'view': {
-        'notes': d.pop('other_views_notes', None),
-      }
-    },
-  }
-
-  if is_released and f.shipped_milestone:
-    d['browsers']['chrome']['status']['milestone_str'] = f.shipped_milestone
-  elif is_released and f.shipped_android_milestone:
-    d['browsers']['chrome']['status']['milestone_str'] = f.shipped_android_milestone
-  else:
-    d['browsers']['chrome']['status']['milestone_str'] = d['browsers']['chrome']['status']['text']
-
-  del_none(d) # Further prune response by removing null/[] values.
-  return d
-
-
 ## FeatureEntry converter methods ##
 def _date_to_str(date: Optional[datetime.datetime]) -> Optional[str]:
   """Returns a string interpretation of a datetime object, or None."""
   return str(date) if date is not None else None
 
 
-def _val_to_list(items: Optional[list]) -> list:
+def _val_to_list(items: list | None) -> list:
   """Returns the given list, or returns an empty list if null."""
   return items if items is not None else []
 
 
-def _stage_attr(
-    stage: Optional[Stage], field: str, is_mstone: bool=False) -> Optional[Any]:
+def _stage_attr(stage: Stage | None, field: str) -> Any:
   """Returns a specified field of a Stage entity."""
-  if stage is None:
-    return None
-  if not is_mstone:
-    return getattr(stage, field)
+  return None if stage is None else getattr(stage, field)
 
-  if stage.milestones is None:
+def _get_milestone_attr(stage: Stage | None, field: str) -> int | None:
+  """Returns a specified milestone field of a Stage entity."""
+  if stage is None or stage.milestones is None:
     return None
   return getattr(stage.milestones, field)
 
 
-def _prep_stage_gate_info(
-    fe: FeatureEntry, d: dict,
+# Return type for _prep_stage_info function.
+class StagePrepResponse(TypedDict):
+  proto: Stage | None
+  dev_trial: Stage | None
+  ot: Stage | None
+  extend: Stage | None
+  ship: Stage | None
+  rollout: Stage | None
+  all_stages: list[StageDict]
+
+
+def _prep_stage_info(
+    fe: FeatureEntry,
     prefetched_stages: list[Stage] | None=None
-    ) -> dict[str, Optional[Stage]]:
-  """Adds stage and gate info to the dict and returns major stage info."""
+    ) -> StagePrepResponse:
+  """Prepares stage info of a feature to help create JSON dictionaries."""
   proto_type = STAGE_TYPES_PROTOTYPE[fe.feature_type]
   dev_trial_type = STAGE_TYPES_DEV_TRIAL[fe.feature_type]
   ot_type = STAGE_TYPES_ORIGIN_TRIAL[fe.feature_type]
@@ -240,315 +121,405 @@ def _prep_stage_gate_info(
 
   # Get all stages associated with the feature, sorted by stage type.
   if prefetched_stages is not None:
-    prefetched_stages.sort(key=lambda s: s.stage_type)
     stages = prefetched_stages
   else:
-    stages = Stage.query(Stage.feature_id == d['id']).order(Stage.stage_type)
-
-  major_stages: dict[str, Optional[Stage]] = {
+    stages = Stage.query(Stage.feature_id == fe.key.integer_id(), Stage.archived == False)
+  stage_info: StagePrepResponse = {
       'proto': None,
       'dev_trial': None,
       'ot': None,
       'extend': None,
       'ship': None,
-      'rollout': None}
-
-  # Write a list of stages associated with the feature.
-  d['stages'] = []
+      'rollout': None,
+      # Write a list of all stages associated with the feature.
+      'all_stages': []}
 
   # Keep track of trial stage indexes so that we can add trial extension
   # stages as a property of the trial stage later.
   ot_stage_indexes: dict[int, int] = {}
+  extension_stages: list[StageDict] = []
   for s in stages:
     stage_dict = stage_to_json_dict(s, fe.feature_type)
     # Keep major stages for referencing additional fields.
     if s.stage_type == proto_type:
-      major_stages['proto'] = s
+      stage_info['proto'] = s
     elif s.stage_type == dev_trial_type:
-      major_stages['dev_trial'] = s
+      stage_info['dev_trial'] = s
     elif s.stage_type == ot_type:
       # Keep the stage's index to add trial extensions later.
-      ot_stage_indexes[s.key.integer_id()] = len(d['stages'])
+      ot_stage_indexes[s.key.integer_id()] = len(stage_info['all_stages'])
       stage_dict['extensions'] = []
-      major_stages['ot'] = s
+      stage_info['ot'] = s
     elif s.stage_type == extend_type:
-      # Trial extensions are kept as a list on the associated trial stage dict.
-      if s.ot_stage_id and s.ot_stage_id in ot_stage_indexes:
-        (d['stages'][ot_stage_indexes[s.ot_stage_id]]['extensions']
-            .append(stage_dict))
-      major_stages['extend'] = s
+      extension_stages.append(stage_dict)
+      stage_info['extend'] = s
       # No need to append the extension stage to the overall stages list.
       continue
     elif s.stage_type == ship_type:
-      major_stages['ship'] = s
+      stage_info['ship'] = s
     elif s.stage_type == rollout_type:
-      major_stages['rollout'] = s
-    d['stages'].append(stage_dict)
+      stage_info['rollout'] = s
+    stage_info['all_stages'].append(stage_dict)
 
-  return major_stages
-
-
-# This function is a workaround to reference extension stage info on
-# origin trial stages.
-# TODO(danielrsmith): Remove this once users can manually add trial extension
-# stages.
-def _add_ot_extension_fields(d: dict):
-  """Adds info from the trial extension stage to the OT stage dict."""
-  extension_stage = Stage.query(
-      Stage.ot_stage_id == d['id']).get()
-  if extension_stage is None:
-    return
-  d['experiment_extension_reason'] = extension_stage.experiment_extension_reason
-  d['intent_to_extend_experiment_url'] = (
-    extension_stage.intent_thread_url)
+  for extension in extension_stages:
+    # Trial extensions are kept as a list on the associated trial stage dict.
+    ot_id = extension['ot_stage_id']
+    if ot_id and ot_id in ot_stage_indexes:
+      (stage_info['all_stages'][ot_stage_indexes[ot_id]]['extensions']
+          .append(extension))
+  stage_info['all_stages'].sort(key=lambda s: (s['stage_type'], s['created']))
+  # Sort all extensions in order of creation as well.
+  for stage in stage_info['all_stages']:
+    stage['extensions'].sort(key=lambda s: (s['created']))
+  return stage_info
 
 
 def stage_to_json_dict(
-    stage: Stage, feature_type: int | None=None) -> dict[str, Any]:
+    stage: Stage, feature_type: int | None=None) -> StageDict:
   """Convert a stage entity into a JSON dict."""
   # Get feature type if not supplied.
   if feature_type is None:
     f = FeatureEntry.get_by_id(stage.feature_id)
     feature_type = f.feature_type
+  milestones: MilestoneSet = stage.milestones or MilestoneSet()
 
-  d: dict[str, Any] = {}
-  d['id'] = stage.key.integer_id()
-  d['feature_id'] = stage.feature_id
-  d['stage_type'] = stage.stage_type
-  d['intent_stage'] = INTENT_STAGES_BY_STAGE_TYPE.get(
-      d['stage_type'], INTENT_NONE)
+  d: StageDict = {
+    'id': stage.key.integer_id(),
+    'created': str(stage.created),
+    'feature_id': stage.feature_id,
+    'stage_type': stage.stage_type,
+    'display_name': stage.display_name,
+    'intent_stage': INTENT_STAGES_BY_STAGE_TYPE.get(
+        stage.stage_type, INTENT_NONE),
+    'pm_emails': stage.pm_emails,
+    'tl_emails': stage.tl_emails,
+    'ux_emails': stage.ux_emails,
+    'te_emails': stage.te_emails,
+    'intent_thread_url': stage.intent_thread_url,
 
-  # Determine the stage type and handle stage-specific fields.
-  # TODO(danielrsmith): Change client to use new field names.
-  milestone_field_names: list[dict] | None = None
-  if d['stage_type'] == STAGE_TYPES_PROTOTYPE[feature_type]:
-    d['intent_to_implement_url'] = stage.intent_thread_url
-  elif d['stage_type'] == STAGE_TYPES_DEV_TRIAL[feature_type]:
-    d['ready_for_trial_url'] = stage.announcement_url
-    milestone_field_names = MilestoneSet.DEV_TRIAL_MILESTONE_FIELD_NAMES
-  elif d['stage_type'] == STAGE_TYPES_ORIGIN_TRIAL[feature_type]:
-    d['intent_to_experiment_url'] = stage.intent_thread_url
-    d['experiment_goals'] = stage.experiment_goals
-    d['experiment_risks'] = stage.experiment_risks
-    d['origin_trial_feedback_url'] = stage.origin_trial_feedback_url
-    _add_ot_extension_fields(d)
-    milestone_field_names = MilestoneSet.OT_MILESTONE_FIELD_NAMES
-  elif d['stage_type'] == STAGE_TYPES_EXTEND_ORIGIN_TRIAL[feature_type]:
-    d['experiment_extension_reason'] = stage.experiment_extension_reason
-    d['intent_to_extend_experiment_url'] = stage.intent_thread_url
-    d['ot_stage_id'] = stage.ot_stage_id
-    milestone_field_names = MilestoneSet.OT_EXTENSION_MILESTONE_FIELD_NAMES
-  elif d['stage_type'] == STAGE_TYPES_SHIPPING[feature_type]:
-    d['intent_to_ship_url'] = stage.intent_thread_url
-    d['finch_url'] = stage.finch_url
-    milestone_field_names = MilestoneSet.SHIPPING_MILESTONE_FIELD_NAMES
-  elif d['stage_type'] == STAGE_TYPES_ROLLOUT[feature_type]:
-    d['rollout_milestone'] = stage.rollout_milestone
-    d['rollout_platforms'] = stage.rollout_platforms
-    d['rollout_details'] = stage.rollout_details
-    d['enterprise_policies'] = stage.enterprise_policies
+    'announcement_url': stage.announcement_url,
+    'experiment_goals': stage.experiment_goals,
+    'experiment_risks': stage.experiment_risks,
+    'origin_trial_id': stage.origin_trial_id,
+    'origin_trial_feedback_url': stage.origin_trial_feedback_url,
+    'ot_action_requested': stage.ot_action_requested,
+    'ot_approval_buganizer_component': stage.ot_approval_buganizer_component,
+    'ot_approval_buganizer_custom_field_id': (
+        stage.ot_approval_buganizer_custom_field_id),
+    'ot_approval_criteria_url': stage.ot_approval_criteria_url,
+    'ot_approval_group_email': stage.ot_approval_group_email,
+    'ot_chromium_trial_name': stage.ot_chromium_trial_name,
+    'ot_description': stage.ot_description,
+    'ot_display_name': stage.ot_display_name,
+    'ot_documentation_url': stage.ot_documentation_url,
+    'ot_emails': stage.ot_emails,
+    'ot_feedback_submission_url': stage.ot_feedback_submission_url,
+    'ot_has_third_party_support': stage.ot_has_third_party_support,
+    'ot_is_critical_trial': stage.ot_is_critical_trial,
+    'ot_is_deprecation_trial': stage.ot_is_deprecation_trial,
+    'ot_owner_email': stage.ot_owner_email,
+    'ot_require_approvals': stage.ot_require_approvals,
+    'ot_use_counter_bucket_number': stage.ot_use_counter_bucket_number,
+    'ot_webfeature_use_counter': stage.ot_webfeature_use_counter,
+    'extensions': [],
+    'experiment_extension_reason': stage.experiment_extension_reason,
+    'ot_stage_id': stage.ot_stage_id,
+    'finch_url': stage.finch_url,
 
-  # Add milestone fields
-  if stage.milestones is not None and milestone_field_names is not None:
-    for name_info in milestone_field_names:
-      # The old val name is still used on the client side.
-      # TODO(danielrsmith): Change client to use new field names.
-      d[name_info['old']] = getattr(stage.milestones, name_info['new'])
-      d[name_info['new']] = getattr(stage.milestones, name_info['new'])
+    'rollout_milestone': stage.rollout_milestone,
+    'rollout_platforms': stage.rollout_platforms,
+    'rollout_details': stage.rollout_details,
+    'rollout_impact': stage.rollout_impact,
+    'enterprise_policies': stage.enterprise_policies,
 
-  d['pm_emails'] = stage.pm_emails
-  d['tl_emails'] = stage.tl_emails
-  d['ux_emails'] = stage.ux_emails
-  d['te_emails'] = stage.te_emails
-  d['intent_thread_url'] = stage.intent_thread_url
+    # Milestone fields to be populated later.
+    'desktop_first': milestones.desktop_first,
+    'android_first': milestones.android_first,
+    'ios_first': milestones.ios_first,
+    'webview_first': milestones.webview_first,
+    'desktop_last': milestones.desktop_last,
+    'android_last': milestones.android_last,
+    'ios_last': milestones.ios_last,
+    'webview_last': milestones.webview_last,
+  }
+
+  if stage.ot_activation_date:
+    d['ot_activation_date'] = str(stage.ot_activation_date)
+  if stage.ot_setup_status:
+    d['ot_setup_status'] = stage.ot_setup_status
 
   return d
 
 
+def _parse_crbug_number(bug_url: Optional[str]) -> Optional[str]:
+  if bug_url is None:
+    return None
+  m = re.search(r'[\/|?id=]([0-9]+)$', bug_url)
+  if m:
+    return m.group(1)
+  return None
+
+
+def _format_new_crbug_url(blink_components: Optional[list[str]],
+    bug_url: Optional[str], impl_status_chrome: int,
+    owner_emails: list[str]=list()) -> str:
+  url = 'https://bugs.chromium.org/p/chromium/issues/entry'
+  if blink_components and len(blink_components) > 0:
+    params = ['components=' + blink_components[0]]
+  else:
+    params = ['components=' + settings.DEFAULT_COMPONENT]
+  crbug_number = _parse_crbug_number(bug_url)
+  if crbug_number and impl_status_chrome in (
+      NO_ACTIVE_DEV,
+      PROPOSED,
+      IN_DEVELOPMENT,
+      BEHIND_A_FLAG,
+      ORIGIN_TRIAL,
+      INTERVENTION):
+    params.append('blocking=' + crbug_number)
+  if owner_emails:
+    params.append('cc=' + ','.join(owner_emails))
+  return url + '?' + '&'.join(params)
+
+
+_COMPUTED_VIEWS_TO_ENUM = {
+  ReviewResultProperty.CLOSED_WITHOUT_POSITION: NO_PUBLIC_SIGNALS,
+  'defer': GECKO_DEFER,
+  'negative': OPPOSED,
+  'neutral': NEUTRAL,
+  'oppose': OPPOSED,
+  'positive': PUBLIC_SUPPORT,
+  'support': PUBLIC_SUPPORT,
+  'under consideration': GECKO_UNDER_CONSIDERATION,
+}
+
+
+def _compute_vendor_views(
+  url: Optional[str], computed_views: Optional[str], form_views: int, notes: str
+) -> FeatureDictInnerViewInfo:
+  result: FeatureDictInnerViewInfo = {
+    'url': url,
+    'notes': notes,
+    'text': None,
+    'val': NO_PUBLIC_SIGNALS,
+  }
+  if computed_views and form_views not in [SHIPPED, IN_DEV]:
+    result['text'] = (
+      'Closed Without a Position'
+      if computed_views == ReviewResultProperty.CLOSED_WITHOUT_POSITION
+      else computed_views.title()
+    )
+    result['val'] = _COMPUTED_VIEWS_TO_ENUM.get(
+      computed_views, form_views if form_views in VENDOR_VIEWS else NO_PUBLIC_SIGNALS
+    )
+  else:
+    result['text'] = VENDOR_VIEWS.get(
+      form_views, VENDOR_VIEWS_COMMON[NO_PUBLIC_SIGNALS]
+    )
+    result['val'] = form_views if form_views in VENDOR_VIEWS else NO_PUBLIC_SIGNALS
+  return result
+
+
 def feature_entry_to_json_verbose(
     fe: FeatureEntry, prefetched_stages: list[Stage] | None=None
-    ) -> dict[str, Any]:
+    ) -> VerboseFeatureDict:
   """Returns a verbose dictionary with all info about a feature."""
   # Do not convert to JSON if the entity has not been saved.
   if not fe.key:
-    return {}
+    raise Exception('Unsaved FeatureEntry cannot be converted.')
 
-  d: dict[str, Any] = fe.to_dict()
+  id: int = fe.key.integer_id()
 
-  d['id'] = fe.key.integer_id()
+  # Get stage info, returning it to be more explicitly added.
+  stage_info = _prep_stage_info(
+      fe, prefetched_stages=prefetched_stages)
 
-  # Get stage and gate info, returning stage info to be more explicitly added.
-  stages = _prep_stage_gate_info(fe, d, prefetched_stages=prefetched_stages)
-  # Prototype stage fields.
-  d['intent_to_implement_url'] = _stage_attr(
-      stages['proto'], 'intent_thread_url')
+  new_crbug_url = _format_new_crbug_url(
+      fe.blink_components, fe.bug_url, fe.impl_status_chrome, fe.owner_emails)
 
-  # Dev trial stage fields.
-  d['dt_milestone_desktop_start'] = _stage_attr(
-      stages['dev_trial'], 'desktop_first', True)
-  d['dt_milestone_android_start'] = _stage_attr(
-      stages['dev_trial'], 'android_first', True)
-  d['dt_milestone_ios_start'] = _stage_attr(
-      stages['dev_trial'], 'ios_first', True)
-  d['dt_milestone_webview_start'] = _stage_attr(
-      stages['dev_trial'], 'webview_first', True)
-  d['ready_for_trial_url'] = _stage_attr(
-      stages['dev_trial'], 'announcement_url')
-
-  # Origin trial stage fields.
-  d['ot_milestone_desktop_start'] = _stage_attr(
-      stages['ot'], 'desktop_first', True)
-  d['ot_milestone_android_start'] = _stage_attr(
-      stages['ot'], 'android_first', True)
-  d['ot_milestone_webview_start'] = _stage_attr(
-      stages['ot'], 'webview_first', True)
-  d['ot_milestone_desktop_end'] = _stage_attr(
-      stages['ot'], 'desktop_last', True)
-  d['ot_milestone_android_end'] = _stage_attr(
-      stages['ot'], 'android_last', True)
-  d['ot_milestone_webview_end'] = _stage_attr(
-      stages['ot'], 'webview_last', True)
-  d['origin_trial_feeback_url'] = _stage_attr(
-      stages['ot'], 'origin_trial_feedback_url')
-  d['intent_to_experiment_url'] = _stage_attr(
-      stages['ot'], 'intent_thread_url')
-  d['experiment_goals'] = _stage_attr(stages['ot'], 'experiment_goals')
-  d['experiment_risks'] = _stage_attr(stages['ot'], 'experiment_risks')
-  d['announcement_url'] = _stage_attr(stages['ot'], 'announcement_url')
-
-  # Extend origin trial stage fields.
-  d['experiment_extension_reason'] = _stage_attr(
-      stages['extend'], 'experiment_extension_reason')
-  d['intent_to_extend_experiment_url'] = _stage_attr(
-      stages['extend'], 'intent_thread_url')
-
-  # Ship stage fields.
-  d['intent_to_ship_url'] = _stage_attr(stages['ship'], 'intent_thread_url')
-  d['finch_url'] = _stage_attr(stages['ship'], 'finch_url')
-  d['rollout_milestone'] = _stage_attr(stages['rollout'], 'rollout_milestone')
-  d['rollout_platforms'] = _stage_attr(stages['rollout'], 'rollout_platforms')
-  d['rollout_details'] = _stage_attr(stages['rollout'], 'rollout_details')
-  d['enterprise_policies'] = _stage_attr(stages['rollout'], 'enterprise_policies')
-
-  # TODO(danielrsmith): Adjust the references to this JSON to use
-  # the new renamed field names.
-  impl_status_chrome = d.pop('impl_status_chrome', None)
-  standard_maturity = d.pop('standard_maturity', None)
-  d['is_released'] = fe.impl_status_chrome in RELEASE_IMPL_STATES
-  d['category'] = FEATURE_CATEGORIES[fe.category]
-  d['category_int'] = fe.category
-  if fe.feature_type is not None:
-    d['feature_type'] = FEATURE_TYPES[fe.feature_type]
-    d['feature_type_int'] = fe.feature_type
-  if fe.intent_stage is not None:
-    d['intent_stage'] = INTENT_STAGES.get(
-        fe.intent_stage, INTENT_STAGES[INTENT_NONE])
-    d['intent_stage_int'] = fe.intent_stage
-  d['active_stage_id'] = fe.active_stage_id
-  d['created'] = {
-    'by': d.pop('creator_email', None),
-    'when': _date_to_str(fe.created),
-  }
-  d['updated'] = {
-    'by': d.pop('updater_email', None),
-    'when': _date_to_str(fe.updated),
-  }
-  d['accurate_as_of'] = _date_to_str(fe.accurate_as_of)
-  d['standards'] = {
-    'spec': fe.spec_link,
-    'maturity': {
-      'text': STANDARD_MATURITY_CHOICES.get(standard_maturity),
-      'short_text': STANDARD_MATURITY_SHORT.get(standard_maturity),
-      'val': standard_maturity,
+  d: VerboseFeatureDict = {
+    'id': id,
+    'name': fe.name,
+    'summary': fe.summary,
+    'blink_components': fe.blink_components or [],
+    'star_count': fe.star_count,
+    'search_tags': fe.search_tags or [],
+    'created': {
+      'by': fe.creator_email,
+      'when': _date_to_str(fe.created),
     },
-  }
-  d['spec_mentors'] = fe.spec_mentor_emails
-  d['tag_review_status'] = REVIEW_STATUS_CHOICES[fe.tag_review_status]
-  d['tag_review_status_int'] = fe.tag_review_status
-  d['security_review_status'] = REVIEW_STATUS_CHOICES[
-      fe.security_review_status]
-  d['security_review_status_int'] = fe.security_review_status
-  d['privacy_review_status'] = REVIEW_STATUS_CHOICES[fe.privacy_review_status]
-  d['privacy_review_status_int'] = fe.privacy_review_status
-  d['resources'] = {
-    'samples': _val_to_list(fe.sample_links),
-    'docs': _val_to_list(fe.doc_links),
-  }
-  d['tags'] = d.pop('search_tags', None)
-  d['editors'] =  d.pop('editor_emails', [])
-  d['cc_recipients'] = d.pop('cc_emails', [])
-  d['creator'] = fe.creator_email
-  d['comments'] = d.pop('feature_notes', None)
-
-  ff_views = d.pop('ff_views', NO_PUBLIC_SIGNALS)
-  safari_views = d.pop('safari_views', NO_PUBLIC_SIGNALS)
-  web_dev_views = d.pop('web_dev_views', DEV_NO_SIGNALS)
-  d['browsers'] = {
-    'chrome': {
-      'bug': fe.bug_url,
-      'blink_components': d.pop('blink_components', []),
-      'devrel': _val_to_list(fe.devrel_emails),
-      'owners': d.pop('owner_emails', []),
-      'origintrial': fe.impl_status_chrome == ORIGIN_TRIAL,
-      'intervention': fe.impl_status_chrome == INTERVENTION,
-      'prefixed': fe.prefixed,
-      'flag': fe.impl_status_chrome == BEHIND_A_FLAG,
-      'status': {
-        'text': IMPLEMENTATION_STATUS[impl_status_chrome],
-        'val': impl_status_chrome
+    'updated': {
+      'by': fe.updater_email,
+      'when': _date_to_str(fe.updated),
+    },
+    'category': FEATURE_CATEGORIES[fe.category],
+    'category_int': fe.category,
+    'feature_notes': fe.feature_notes,
+    'web_feature': fe.web_feature,
+    'enterprise_feature_categories': fe.enterprise_feature_categories or [],
+    'enterprise_product_category': fe.enterprise_product_category or ENTERPRISE_PRODUCT_CATEGORY_CHROME_BROWSER_UPDATE,
+    'stages': stage_info['all_stages'],
+    'accurate_as_of': _date_to_str(fe.accurate_as_of),
+    'creator_email': fe.creator_email,
+    'updater_email': fe.updater_email,
+    'owner_emails': fe.owner_emails or [],
+    'editor_emails': fe.editor_emails or [],
+    'cc_emails': fe.cc_emails or [],
+    'spec_mentor_emails': fe.spec_mentor_emails or [],
+    'unlisted': fe.unlisted,
+    'deleted': fe.deleted,
+    'editors': fe.editor_emails or [],
+    'cc_recipients': fe.cc_emails or [],
+    'spec_mentors': fe.spec_mentor_emails or [],
+    'creator': fe.creator_email,
+    'feature_type': FEATURE_TYPES[fe.feature_type],
+    'feature_type_int': fe.feature_type,
+    'intent_stage': INTENT_STAGES.get(fe.intent_stage, INTENT_STAGES[INTENT_NONE]),
+    'intent_stage_int': fe.intent_stage,
+    'active_stage_id': fe.active_stage_id,
+    'bug_url': fe.bug_url,
+    'launch_bug_url': fe.launch_bug_url,
+    'new_crbug_url': new_crbug_url,
+    'screenshot_links': fe.screenshot_links or [],
+    'first_enterprise_notification_milestone': fe.first_enterprise_notification_milestone,
+    'enterprise_impact': fe.enterprise_impact,
+    'breaking_change': fe.breaking_change,
+    'confidential': fe.confidential,
+    'shipping_year': fe.shipping_year,
+    'flag_name': fe.flag_name,
+    'finch_name': fe.finch_name,
+    'non_finch_justification': fe.non_finch_justification,
+    'ongoing_constraints': fe.ongoing_constraints,
+    'motivation': fe.motivation,
+    'devtrial_instructions': fe.devtrial_instructions,
+    'activation_risks': fe.activation_risks,
+    'measurement': fe.measurement,
+    'availability_expectation': fe.availability_expectation,
+    'adoption_expectation': fe.adoption_expectation,
+    'adoption_plan': fe.adoption_plan,
+    'initial_public_proposal_url': fe.initial_public_proposal_url,
+    'explainer_links': fe.explainer_links,
+    'requires_embedder_support': fe.requires_embedder_support,
+    'spec_link': fe.spec_link,
+    'api_spec': fe.api_spec,
+    'interop_compat_risks': fe.interop_compat_risks,
+    'all_platforms': fe.all_platforms,
+    'all_platforms_descr': fe.all_platforms_descr,
+    'non_oss_deps': fe.non_oss_deps,
+    'anticipated_spec_changes': fe.anticipated_spec_changes,
+    'security_risks': fe.security_risks,
+    'ergonomics_risks': fe.ergonomics_risks,
+    'wpt': fe.wpt,
+    'wpt_descr': fe.wpt_descr,
+    'webview_risks': fe.webview_risks,
+    'devrel_emails': fe.devrel_emails or [],
+    'debuggability': fe.debuggability,
+    'doc_links': fe.doc_links or [],
+    'sample_links': fe.sample_links or [],
+    'prefixed': fe.prefixed,
+    'tags': fe.search_tags,
+    'tag_review': fe.tag_review,
+    'tag_review_status': REVIEW_STATUS_CHOICES.get(
+      fe.tag_review_status, REVIEW_STATUS_CHOICES[REVIEW_PENDING]
+    ),
+    'tag_review_status_int': fe.tag_review_status,
+    'security_review_status': REVIEW_STATUS_CHOICES.get(
+      fe.security_review_status, REVIEW_STATUS_CHOICES[REVIEW_PENDING]
+    ),
+    'security_review_status_int': fe.security_review_status,
+    'privacy_review_status': REVIEW_STATUS_CHOICES.get(
+      fe.privacy_review_status, REVIEW_STATUS_CHOICES[REVIEW_PENDING]
+    ),
+    'privacy_review_status_int': fe.privacy_review_status,
+    'updated_display': None,
+    'resources': {
+      'samples': fe.sample_links or [],
+      'docs': fe.doc_links or [],
+    },
+    'comments': fe.feature_notes,
+    'ff_views': fe.ff_views or NO_PUBLIC_SIGNALS,
+    'safari_views': fe.safari_views or NO_PUBLIC_SIGNALS,
+    'web_dev_views': fe.web_dev_views or DEV_NO_SIGNALS,
+    'browsers': {
+      'chrome': {
+        'bug': fe.bug_url,
+        'blink_components': fe.blink_components or [],
+        'devrel': fe.devrel_emails or [],
+        'owners': fe.owner_emails or [],
+        'origintrial': fe.impl_status_chrome == ORIGIN_TRIAL,
+        'intervention': fe.impl_status_chrome == INTERVENTION,
+        'prefixed': fe.prefixed,
+        'flag': fe.impl_status_chrome == BEHIND_A_FLAG,
+        'status': {
+          'text': IMPLEMENTATION_STATUS[fe.impl_status_chrome],
+          'val': fe.impl_status_chrome,
+          'milestone_str': None,
+        },
+        # TODO(danielrsmith): Find out if these are used and delete if not.
+        'desktop': _get_milestone_attr(stage_info['ship'], 'desktop_first'),
+        'android': _get_milestone_attr(stage_info['ship'], 'android_first'),
+        'webview': _get_milestone_attr(stage_info['ship'], 'webview_first'),
+        'ios': _get_milestone_attr(stage_info['ship'], 'ios_first'),
       },
-      'desktop': _stage_attr(stages['ship'], 'desktop_first', True),
-      'android': _stage_attr(stages['ship'], 'android_first', True),
-      'webview': _stage_attr(stages['ship'], 'webview_first', True),
-      'ios': _stage_attr(stages['ship'], 'ios_first', True),
+      'ff': {
+        'view': _compute_vendor_views(
+          fe.ff_views_link, fe.ff_views_link_result, fe.ff_views, fe.ff_views_notes
+        ),
+      },
+      'safari': {
+        'view': _compute_vendor_views(
+          fe.safari_views_link,
+          fe.safari_views_link_result,
+          fe.safari_views,
+          fe.safari_views_notes,
+        ),
+      },
+      'webdev': {
+        'view': {
+          'text': WEB_DEV_VIEWS.get(fe.web_dev_views, WEB_DEV_VIEWS[DEV_NO_SIGNALS]),
+          'val': (
+            fe.web_dev_views if fe.web_dev_views in WEB_DEV_VIEWS else DEV_NO_SIGNALS
+          ),
+          'url': fe.web_dev_views_link,
+          'notes': fe.web_dev_views_notes,
+        },
+      },
+      'other': {
+        'view': {
+          'text': None,
+          'val': None,
+          'url': None,
+          'notes': fe.other_views_notes,
+        },
+      },
     },
-    'ff': {
-      'view': {
-        'text': VENDOR_VIEWS.get(ff_views,
-            VENDOR_VIEWS_COMMON[NO_PUBLIC_SIGNALS]),
-        'val': ff_views if ff_views in VENDOR_VIEWS else NO_PUBLIC_SIGNALS,
-        'url': d.pop('ff_views_link', None),
-        'notes': d.pop('ff_views_notes'),
-      }
+    'enterprise_feature_categories': fe.enterprise_feature_categories or [],
+    'enterprise_product_category': fe.enterprise_product_category or ENTERPRISE_PRODUCT_CATEGORY_CHROME_BROWSER_UPDATE,
+    'standards': {
+      'spec': fe.spec_link,
+      'maturity': {
+        'text': STANDARD_MATURITY_CHOICES.get(fe.standard_maturity),
+        'short_text': STANDARD_MATURITY_SHORT.get(fe.standard_maturity),
+        'val': fe.standard_maturity,
+      },
     },
-    'safari': {
-      'view': {
-        'text': VENDOR_VIEWS.get(safari_views,
-            VENDOR_VIEWS_COMMON[NO_PUBLIC_SIGNALS]),
-        'val': (safari_views if safari_views in VENDOR_VIEWS
-            else NO_PUBLIC_SIGNALS),
-        'url': d.pop('safari_views_link', None),
-        'notes': d.pop('safari_views_notes', None),
-      }
-    },
-    'webdev': {
-      'view': {
-        'text': WEB_DEV_VIEWS.get(web_dev_views,
-            WEB_DEV_VIEWS[DEV_NO_SIGNALS]),
-        'val': (web_dev_views if web_dev_views in WEB_DEV_VIEWS
-            else DEV_NO_SIGNALS),
-        'url': d.pop('web_dev_views_link', None),
-        'notes': d.pop('web_dev_views_notes', None),
-      }
-    },
-    'other': {
-      'view': {
-        'notes': d.pop('other_views_notes', None),
-      }
-    },
+    'is_released': fe.impl_status_chrome in RELEASE_IMPL_STATES,
+    'is_enterprise_feature': fe.feature_type == FEATURE_TYPE_ENTERPRISE_ID,
+    'experiment_timeline': fe.experiment_timeline,
   }
 
-  if d['is_released'] and _stage_attr(stages['ship'], 'desktop_first', True):
-    d['browsers']['chrome']['status']['milestone_str'] = (
-        _stage_attr(stages['ship'], 'desktop_first', True))
-  elif d['is_released'] and _stage_attr(stages['ship'], 'android_first', True):
-    d['browsers']['chrome']['status']['milestone_str'] = (
-        _stage_attr(stages['ship'], 'android_first', True))
+  if (d['is_released'] and
+      _get_milestone_attr(stage_info['ship'], 'desktop_first')):
+    d['browsers']['chrome']['status']['milestone_str'] = str(
+        _get_milestone_attr(stage_info['ship'], 'desktop_first'))
+  elif (d['is_released'] and
+        _get_milestone_attr(stage_info['ship'], 'android_first')):
+    d['browsers']['chrome']['status']['milestone_str'] = str(
+        _get_milestone_attr(stage_info['ship'], 'android_first'))
   else:
     d['browsers']['chrome']['status']['milestone_str'] = (
         d['browsers']['chrome']['status']['text'])
 
-  del_none(d) # Further prune response by removing null/[] values.
   return d
 
 
@@ -564,20 +535,22 @@ def feature_entry_to_json_basic(fe: FeatureEntry,
     'name': fe.name,
     'summary': fe.summary,
     'unlisted': fe.unlisted,
+    'enterprise_impact': fe.enterprise_impact,
+    'enterprise_product_category': fe.enterprise_product_category or ENTERPRISE_PRODUCT_CATEGORY_CHROME_BROWSER_UPDATE,
     'breaking_change': fe.breaking_change,
+    'confidential': fe.confidential,
+    'first_enterprise_notification_milestone': fe.first_enterprise_notification_milestone,
     'blink_components': fe.blink_components or [],
     'resources': {
       'samples': fe.sample_links or [],
       'docs': fe.doc_links or [],
     },
-    'created': {
-      'by': fe.creator_email,
-      'when': _date_to_str(fe.created)
-    },
-    'updated': {
-      'by': fe.updater_email,
-      'when': _date_to_str(fe.updated)
-    },
+    'creator': fe.creator_email,
+    'editors': fe.editor_emails or [],
+    'owners': fe.owner_emails or [],
+    'created': {'by': fe.creator_email, 'when': _date_to_str(fe.created)},
+    'updated': {'by': fe.updater_email, 'when': _date_to_str(fe.updated)},
+    'accurate_as_of': _date_to_str(fe.accurate_as_of),
     'standards': {
       'spec': fe.spec_link,
       'maturity': {
@@ -598,35 +571,28 @@ def feature_entry_to_json_basic(fe: FeatureEntry,
         'flag': fe.impl_status_chrome == BEHIND_A_FLAG,
         'status': {
           'text': IMPLEMENTATION_STATUS[fe.impl_status_chrome],
-          'val': fe.impl_status_chrome
-        }
+          'val': fe.impl_status_chrome,
+        },
       },
       'ff': {
-        'view': {
-        'text': VENDOR_VIEWS.get(fe.ff_views,
-            VENDOR_VIEWS_COMMON[NO_PUBLIC_SIGNALS]),
-        'val': (fe.ff_views if fe.ff_views in VENDOR_VIEWS
-            else NO_PUBLIC_SIGNALS),
-          'url': fe.ff_views_link,
-          'notes': fe.ff_views_notes,
-        }
+        'view': _compute_vendor_views(
+          fe.ff_views_link, fe.ff_views_link_result, fe.ff_views, fe.ff_views_notes
+        ),
       },
       'safari': {
-        'view': {
-        'text': VENDOR_VIEWS.get(fe.safari_views,
-            VENDOR_VIEWS_COMMON[NO_PUBLIC_SIGNALS]),
-        'val': (fe.safari_views if fe.safari_views in VENDOR_VIEWS
-            else NO_PUBLIC_SIGNALS),
-          'url': fe.safari_views_link,
-          'notes': fe.safari_views_notes,
-        }
+        'view': _compute_vendor_views(
+          fe.safari_views_link,
+          fe.safari_views_link_result,
+          fe.safari_views,
+          fe.safari_views_notes,
+        ),
       },
       'webdev': {
         'view': {
-        'text': WEB_DEV_VIEWS.get(fe.web_dev_views,
-            WEB_DEV_VIEWS[DEV_NO_SIGNALS]),
-        'val': (fe.web_dev_views if fe.web_dev_views in WEB_DEV_VIEWS
-            else DEV_NO_SIGNALS),
+          'text': WEB_DEV_VIEWS.get(fe.web_dev_views, WEB_DEV_VIEWS[DEV_NO_SIGNALS]),
+          'val': (
+            fe.web_dev_views if fe.web_dev_views in WEB_DEV_VIEWS else DEV_NO_SIGNALS
+          ),
           'url': fe.web_dev_views_link,
           'notes': fe.web_dev_views_notes,
         }
@@ -636,7 +602,7 @@ def feature_entry_to_json_basic(fe: FeatureEntry,
           'notes': fe.other_views_notes,
         }
       },
-    }
+    },
   }
 
   is_released = fe.impl_status_chrome in RELEASE_IMPL_STATES
@@ -674,7 +640,37 @@ def vote_value_to_json_dict(vote: Vote) -> dict[str, Any]:
 def gate_value_to_json_dict(gate: Gate) -> dict[str, Any]:
   next_action = str(gate.next_action) if gate.next_action else None
   requested_on = str(gate.requested_on) if gate.requested_on else None
+  responded_on = str(gate.responded_on) if gate.responded_on else None
+  needs_work_started_on = (
+      str(gate.needs_work_started_on) if gate.needs_work_started_on else None)
   appr_def = approval_defs.APPROVAL_FIELDS_BY_ID.get(gate.gate_type)
+  slo_initial_response = approval_defs.DEFAULT_SLO_LIMIT
+  slo_resolve = approval_defs.DEFAULT_SLO_RESOLVE_LIMIT
+  if appr_def:
+    slo_initial_response = appr_def.slo_initial_response
+    slo_resolve = appr_def.slo_resolve
+  slo_initial_response_remaining = None
+  slo_initial_response_took = None
+  slo_resolve_remaining = None
+  slo_resolve_took = None
+  if requested_on:
+    if responded_on:
+      slo_initial_response_took = slo.weekdays_between(
+          gate.requested_on, gate.responded_on)
+    else:
+      slo_initial_response_remaining = slo.remaining_days(
+          gate.requested_on, slo_initial_response)
+    if gate.resolved_on:
+      slo_resolve_took = max(0, slo.weekdays_between(
+          gate.requested_on, gate.resolved_on) - (gate.needs_work_elapsed or 0))
+    elif gate.state != Vote.NEEDS_WORK and gate.state not in Gate.FINAL_STATES:
+      slo_resolve_remaining = slo.remaining_days(
+          gate.requested_on, slo_resolve) + (gate.needs_work_elapsed or 0)
+
+  self_certify_possible = self_certify.is_possible(gate)
+  self_certify_eligible = self_certify.is_eligible(gate)
+  survey_answers = to_dict(gate.survey_answers) if gate.survey_answers else None
+
   return {
       'id': gate.key.integer_id(),
       'feature_id': gate.feature_id,
@@ -682,9 +678,22 @@ def gate_value_to_json_dict(gate: Gate) -> dict[str, Any]:
       'gate_type': gate.gate_type,
       'team_name': appr_def.team_name if appr_def else 'Team',
       'gate_name': appr_def.name if appr_def else 'Gate',
+      'escalation_email': appr_def.escalation_email if appr_def else None,
       'state': gate.state,
       'requested_on': requested_on,  # YYYY-MM-DD HH:MM:SS or None
-      'owners': gate.owners,
+      'responded_on': responded_on,  # YYYY-MM-DD HH:MM:SS or None
+      'assignee_emails': gate.assignee_emails,
       'next_action': next_action,  # YYYY-MM-DD or None
-      'additional_review': gate.additional_review
+      'additional_review': gate.additional_review,
+      'slo_initial_response': slo_initial_response,
+      'slo_initial_response_took': slo_initial_response_took,
+      'slo_initial_response_remaining': slo_initial_response_remaining,
+      'slo_resolve': slo_resolve,
+      'slo_resolve_took': slo_resolve_took,
+      'slo_resolve_remaining': slo_resolve_remaining,
+      # YYYY-MM-DD HH:MM:SS or None
+      'needs_work_started_on': needs_work_started_on,
+      'self_certify_possible': self_certify_possible,
+      'self_certify_eligible': self_certify_eligible,
+      'survey_answers': survey_answers,
       }

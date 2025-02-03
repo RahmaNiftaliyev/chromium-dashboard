@@ -24,6 +24,7 @@ from google.appengine.api import mail
 
 import settings
 from framework import cloud_tasks_helpers
+from internals.user_models import UserPref
 
 
 # Parsing very large messages could cause out-of-memory errors.
@@ -35,7 +36,7 @@ def require_task_header():
   if settings.UNIT_TEST_MODE or settings.DEV_MODE:
     return
   if 'X-AppEngine-QueueName' not in flask.request.headers:
-    flask.abort(403, msg='Lacking X-AppEngine-QueueName header')
+    flask.abort(403, description='Lacking X-AppEngine-QueueName header')
 
 
 def get_param(request, name, required=True):
@@ -43,24 +44,47 @@ def get_param(request, name, required=True):
   json_body = request.get_json(force=True)
   val = json_body.get(name)
   if required and not val:
-    flask.abort(400, msg='Missing parameter %r' % name)
+    flask.abort(400, description='Missing parameter %r' % name)
   return val
+
+
+def format_staging_email(addr: str) -> str:
+  """Format emails addresses to be redirected for staging logging."""
+  if not settings.SEND_ALL_EMAIL_TO:
+    return ''
+  to_user, to_domain = addr.split('@')
+  return settings.SEND_ALL_EMAIL_TO % {'user': to_user, 'domain': to_domain}
 
 
 def handle_outbound_mail_task():
   """Task to send a notification email to one recipient."""
   require_task_header()
+  json_body = flask.request.get_json(force=True)
+  logging.info('params: %r', json_body)
 
   to = get_param(flask.request, 'to')
+  cc = get_param(flask.request, 'cc', required=False)
   from_user = get_param(flask.request, 'from_user', required=False)
   subject = get_param(flask.request, 'subject')
   email_html = get_param(flask.request, 'html')
   references = get_param(flask.request, 'references', required=False)
   reply_to = get_param(flask.request, 'reply_to', required=False)
 
+  if isinstance(to, str):
+    to = [to]
+  if isinstance(cc, str):
+    cc = [cc]
+
   if settings.SEND_ALL_EMAIL_TO and to != settings.REVIEW_COMMENT_MAILING_LIST:
-    to_user, to_domain = to.split('@')
-    to = settings.SEND_ALL_EMAIL_TO % {'user': to_user, 'domain': to_domain}
+    to = [format_staging_email(addr) for addr in to]
+
+    if cc:
+      new_cc = []
+      for cc_addr in cc:
+        cc_user, cc_domain = cc_addr.split('@')
+        new_cc.append(
+            settings.CC_ALL_EMAIL_TO % {'user': cc_user, 'domain': cc_domain})
+      cc = new_cc
 
   sender = 'Chromestatus <admin@%s.appspotmail.com>' % settings.APP_ID
   if from_user:
@@ -72,6 +96,8 @@ def handle_outbound_mail_task():
   if reply_to:
     message.reply_to = reply_to
   message.check_initialized()
+  if cc:
+    message.cc = cc
 
   if references:
     message.headers = {
@@ -82,6 +108,8 @@ def handle_outbound_mail_task():
   logging.info('Will send the following email:\n')
   logging.info('Sender: %s', message.sender)
   logging.info('To: %s', message.to)
+  if cc:
+    logging.info('Cc: %s', message.cc)
   logging.info('Subject: %s', message.subject)
   if reply_to:
     logging.info('Reply-To: %s', message.reply_to)
@@ -117,12 +145,10 @@ def receive(bounce_message):
   subject = 'Mail to %r bounced' % email_addr
   logging.info(subject)
 
-  # TODO(jrobbins): Re-implement this without depending on models.
-  # Instead create a task and then have that processed in py3.
-  # pref_list = user_models.UserPref.get_prefs_for_emails([email_addr])
-  # user_pref = pref_list[0]
-  # user_pref.bounced = True
-  # user_pref.put()
+  pref_list = UserPref.get_prefs_for_emails([email_addr])
+  user_pref = pref_list[0]
+  user_pref.bounced = True
+  user_pref.put()
 
   # Escalate to someone who might do something about it, e.g.
   # find a new owner for a component.
