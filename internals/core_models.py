@@ -17,296 +17,63 @@
 # https://stackoverflow.com/a/33533514
 from __future__ import annotations
 
-import collections
-import datetime
-import logging
-import re
 from typing import Any, Optional
 
 from google.cloud import ndb  # type: ignore
 
 from framework import rediscache
-from framework import users
 from internals.core_enums import *
-from internals import fetchchannels
-from internals import notifier_helpers
-from internals import review_models
 import settings
 
 
-SIMPLE_TYPES = (int, float, bool, dict, str, list)
+class ReviewResultProperty(ndb.StringProperty):
+  """A StringProperty representing the result of an external review.
+
+  These are the values after the `:` in
+  https://github.com/mozilla/standards-positions/labels?q=position%3A,
+  https://github.com/WebKit/standards-positions/labels?q=position%3A, and
+  https://github.com/w3ctag/design-reviews/labels?q=resolution%3A, plus the special value "closed"
+  to represent a review that was closed without a position.
+  """
+
+  CLOSED_WITHOUT_POSITION = 'closed'
 
 
-class DictModel(ndb.Model):
-  # def to_dict(self):
-  #   return dict([(p, str(getattr(self, p))) for p in self.properties()])
-
-  def is_saved(self):
-    if self.key:
-      return True
-    return False
-
-  def to_dict(self):
-    output = {}
-
-    for key, prop in self._properties.items():
-      # Skip obsolete values that are still in our datastore
-      if not hasattr(self, key):
-        continue
-
-      value = getattr(self, key)
-
-      if value is None or isinstance(value, SIMPLE_TYPES):
-        output[key] = value
-      elif isinstance(value, datetime.date):
-        # Convert date/datetime to ms-since-epoch ("new Date()").
-        #ms = time.mktime(value.utctimetuple())
-        #ms += getattr(value, 'microseconds', 0) / 1000
-        #output[key] = int(ms)
-        output[key] = str(value)
-      elif isinstance(value, ndb.GeoPt):
-        output[key] = {'lat': value.lat, 'lon': value.lon}
-      elif isinstance(value, ndb.Model):
-        output[key] = value.to_dict()
-      elif isinstance(value, ndb.model.User):
-        output[key] = value.email()
-      else:
-        raise ValueError('cannot encode ' + repr(prop))
-
-    return output
-
-
-class Feature(DictModel):
-  """Container for a feature."""
-
-  DEFAULT_CACHE_KEY = 'features'
-
-  def __init__(self, *args, **kwargs):
-    # Initialise Feature.blink_components with a default value.  If
-    # name is present in kwargs then it would mean constructor is
-    # being called for creating a new feature rather than for fetching
-    # an existing feature.
-    if 'name' in kwargs:
-      if 'blink_components' not in kwargs:
-        kwargs['blink_components'] = [settings.DEFAULT_COMPONENT]
-
-    super(Feature, self).__init__(*args, **kwargs)
-
-  @classmethod
-  def feature_cache_key(cls, cache_key, feature_id):
-    return '%s|%s' % (cache_key, feature_id)
-
-  @classmethod
-  def feature_cache_prefix(cls):
-    return '%s|*' % (Feature.DEFAULT_CACHE_KEY)
-
-  @classmethod
-  def _first_of_milestone_v2(self, feature_list, milestone, start=0):
-    for i in range(start, len(feature_list)):
-      f = feature_list[i]
-      desktop_milestone = f['browsers']['chrome'].get('desktop', None)
-      android_milestone = f['browsers']['chrome'].get('android', None)
-      status = f['browsers']['chrome']['status'].get('text', None)
-
-      if (str(desktop_milestone) == str(milestone) or status == str(milestone)):
-        return i
-      elif (desktop_milestone == None and
-            str(android_milestone) == str(milestone)):
-        return i
-
-    return -1
-
-  @classmethod
-  def _annotate_first_of_milestones(self, feature_list):
-    try:
-      omaha_data = fetchchannels.get_omaha_data()
-
-      win_versions = omaha_data[0]['versions']
-
-      # Find the latest canary major version from the list of windows versions.
-      canary_versions = [
-          x for x in win_versions
-          if x.get('channel') and x.get('channel').startswith('canary')]
-      LATEST_VERSION = int(canary_versions[0].get('version').split('.')[0])
-
-      milestones = list(range(1, LATEST_VERSION + 1))
-      milestones.reverse()
-      versions = [
-        IMPLEMENTATION_STATUS[PROPOSED],
-        IMPLEMENTATION_STATUS[IN_DEVELOPMENT],
-        IMPLEMENTATION_STATUS[DEPRECATED],
-        ]
-      versions.extend(milestones)
-      versions.append(IMPLEMENTATION_STATUS[NO_ACTIVE_DEV])
-      versions.append(IMPLEMENTATION_STATUS[NO_LONGER_PURSUING])
-
-      last_good_idx = 0
-      for i, ver in enumerate(versions):
-        idx = Feature._first_of_milestone_v2(
-            feature_list, ver, start=last_good_idx)
-        if idx != -1:
-          feature_list[idx]['first_of_milestone'] = True
-          last_good_idx = idx
-    except Exception as e:
-      logging.error(e)
-
-  def put(self, **kwargs) -> Any:
-    key = super(Feature, self).put(**kwargs)
-    # Invalidate rediscache for the individual feature view.
-    cache_key = Feature.feature_cache_key(
-        Feature.DEFAULT_CACHE_KEY, self.key.integer_id())
-    rediscache.delete(cache_key)
-
-    return key
-
-  # Metadata.
-  created = ndb.DateTimeProperty(auto_now_add=True)
-  updated = ndb.DateTimeProperty(auto_now=True)
-  accurate_as_of = ndb.DateTimeProperty(auto_now=False)
-  updated_by = ndb.UserProperty()
-  created_by = ndb.UserProperty()
-
-  # General info.
-  category = ndb.IntegerProperty(required=True)
-  creator = ndb.StringProperty()
-  name = ndb.StringProperty(required=True)
-  feature_type = ndb.IntegerProperty(default=FEATURE_TYPE_INCUBATE_ID)
-  intent_stage = ndb.IntegerProperty(default=INTENT_NONE)
-  summary = ndb.StringProperty(required=True)
-  unlisted = ndb.BooleanProperty(default=False)
-  # TODO(jrobbins): Add an entry_state enum to track app-specific lifecycle
-  # info for a feature entry as distinct from process-specific stage.
-  deleted = ndb.BooleanProperty(default=False)
-  motivation = ndb.StringProperty()
-  star_count = ndb.IntegerProperty(default=0)
-  search_tags = ndb.StringProperty(repeated=True)
-  comments = ndb.StringProperty()
-  owner = ndb.StringProperty(repeated=True)
-  editors = ndb.StringProperty(repeated=True)
-  cc_recipients = ndb.StringProperty(repeated=True)
-  footprint = ndb.IntegerProperty()  # Deprecated
-  breaking_change = ndb.BooleanProperty(default=False)
-
-  # Tracability to intent discussion threads
-  intent_to_implement_url = ndb.StringProperty()
-  intent_to_implement_subject_line = ndb.StringProperty()
-  intent_to_ship_url = ndb.StringProperty()
-  intent_to_ship_subject_line = ndb.StringProperty()
-  ready_for_trial_url = ndb.StringProperty()
-  intent_to_experiment_url = ndb.StringProperty()
-  intent_to_experiment_subject_line = ndb.StringProperty()
-  intent_to_extend_experiment_url = ndb.StringProperty()
-  intent_to_extend_experiment_subject_line = ndb.StringProperty()
-  # Currently, only one is needed.
-  i2e_lgtms = ndb.StringProperty(repeated=True)
-  i2s_lgtms = ndb.StringProperty(repeated=True)
-
-  # Chromium details.
-  bug_url = ndb.StringProperty()
-  launch_bug_url = ndb.StringProperty()
-  initial_public_proposal_url = ndb.StringProperty()
-  blink_components = ndb.StringProperty(repeated=True)
-  devrel = ndb.StringProperty(repeated=True)
-
-  impl_status_chrome = ndb.IntegerProperty(required=True, default=NO_ACTIVE_DEV)
-  shipped_milestone = ndb.IntegerProperty()
-  shipped_android_milestone = ndb.IntegerProperty()
-  shipped_ios_milestone = ndb.IntegerProperty()
-  shipped_webview_milestone = ndb.IntegerProperty()
-  requires_embedder_support = ndb.BooleanProperty(default=False)
-
-  # DevTrial details.
-  devtrial_instructions = ndb.StringProperty()
-  flag_name = ndb.StringProperty()
-  interop_compat_risks = ndb.StringProperty()
-  ergonomics_risks = ndb.StringProperty()
-  activation_risks = ndb.StringProperty()
-  security_risks = ndb.StringProperty()
-  webview_risks = ndb.StringProperty()
-  debuggability = ndb.StringProperty()
-  all_platforms = ndb.BooleanProperty()
-  all_platforms_descr = ndb.StringProperty()
-  wpt = ndb.BooleanProperty()
-  wpt_descr = ndb.StringProperty()
-  dt_milestone_desktop_start = ndb.IntegerProperty()
-  dt_milestone_android_start = ndb.IntegerProperty()
-  dt_milestone_ios_start = ndb.IntegerProperty()
-  # Webview DT is currently not offered in the UI because there is no way
-  # to set flags.
-  dt_milestone_webview_start = ndb.IntegerProperty()
-  # Note: There are no dt end milestones because a dev trail implicitly
-  # ends when the feature ships or is abandoned.
-
-  visibility = ndb.IntegerProperty(required=False, default=1)  # Deprecated
-
-  # Standards details.
-  standardization = ndb.IntegerProperty(required=True,
-      default=EDITORS_DRAFT)  # Deprecated
-  standard_maturity = ndb.IntegerProperty(required=True, default=UNSET_STD)
-  spec_link = ndb.StringProperty()
-  api_spec = ndb.BooleanProperty(default=False)
-  spec_mentors = ndb.StringProperty(repeated=True)
-
-  security_review_status = ndb.IntegerProperty(default=REVIEW_PENDING)
-  privacy_review_status = ndb.IntegerProperty(default=REVIEW_PENDING)
-
-  tag_review = ndb.StringProperty()
-  tag_review_status = ndb.IntegerProperty(default=REVIEW_PENDING)
-
-  prefixed = ndb.BooleanProperty()
-
-  explainer_links = ndb.StringProperty(repeated=True)
-
-  ff_views = ndb.IntegerProperty(required=True, default=NO_PUBLIC_SIGNALS)
-  # Deprecated
-  ie_views = ndb.IntegerProperty(required=True, default=NO_PUBLIC_SIGNALS)
-  safari_views = ndb.IntegerProperty(required=True, default=NO_PUBLIC_SIGNALS)
-  web_dev_views = ndb.IntegerProperty(required=True, default=DEV_NO_SIGNALS)
-
-  ff_views_link = ndb.StringProperty()
-  ie_views_link = ndb.StringProperty()  # Deprecated
-  safari_views_link = ndb.StringProperty()
-  web_dev_views_link = ndb.StringProperty()
-
-  ff_views_notes = ndb.StringProperty()
-  ie_views_notes = ndb.StringProperty()  # Deprecated
-  safari_views_notes = ndb.StringProperty()
-  web_dev_views_notes = ndb.StringProperty()
-  other_views_notes = ndb.StringProperty()
-
-  doc_links = ndb.StringProperty(repeated=True)
-  measurement = ndb.StringProperty()
-  sample_links = ndb.StringProperty(repeated=True)
-  non_oss_deps = ndb.StringProperty()
-
-  experiment_goals = ndb.StringProperty()
-  experiment_timeline = ndb.StringProperty()
-  ot_milestone_desktop_start = ndb.IntegerProperty()
-  ot_milestone_desktop_end = ndb.IntegerProperty()
-  ot_milestone_android_start = ndb.IntegerProperty()
-  ot_milestone_android_end = ndb.IntegerProperty()
-  ot_milestone_webview_start = ndb.IntegerProperty()
-  ot_milestone_webview_end = ndb.IntegerProperty()
-  experiment_risks = ndb.StringProperty()
-  experiment_extension_reason = ndb.StringProperty()
-  ongoing_constraints = ndb.StringProperty()
-  origin_trial_feedback_url = ndb.StringProperty()
-  anticipated_spec_changes = ndb.StringProperty()
-
-  finch_url = ndb.StringProperty()
-
-  # Flag set to avoid migrating data that has already been migrated.
-  stages_migrated = ndb.BooleanProperty(default=False)
-
-
-# Note: This class is not used yet.
 class FeatureEntry(ndb.Model):  # Copy from Feature
   """This is the main representation of a feature that we are tracking."""
+
+  # Fields that should not be mutated by user edit requests.
+  FIELDS_IMMUTABLE_BY_USER = frozenset([
+    'id',
+    'created',
+    'creator_email',
+    'updated',
+    'updater_email',
+    'accurate_as_of',
+    'outstanding_notifications',
+    'deleted',
+    'star_count',
+    'feature_type',
+  ])
+
+  # All required fields needed upon feature creation.
+  REQUIRED_FIELDS = frozenset([
+    'name',
+    'summary',
+    'category',
+    'feature_type',
+    'impl_status_chrome',
+    'standard_maturity',
+    'ff_views',
+    'safari_views',
+    'web_dev_views',
+  ])
 
   # Metadata: Creation and updates.
   created = ndb.DateTimeProperty(auto_now_add=True)
   updated = ndb.DateTimeProperty(auto_now_add=True)
   accurate_as_of = ndb.DateTimeProperty()
+  outstanding_notifications = ndb.IntegerProperty(default=0)
   creator_email = ndb.StringProperty()
   updater_email = ndb.StringProperty()
 
@@ -321,29 +88,42 @@ class FeatureEntry(ndb.Model):  # Copy from Feature
   name = ndb.StringProperty(required=True)
   summary = ndb.TextProperty(required=True)
   category = ndb.IntegerProperty(required=True)
+  enterprise_product_category = ndb.IntegerProperty(required=False, default=ENTERPRISE_PRODUCT_CATEGORY_CHROME_BROWSER_UPDATE)
+  enterprise_feature_categories = ndb.StringProperty(repeated=True)
   blink_components = ndb.StringProperty(repeated=True)
   star_count = ndb.IntegerProperty(default=0)
   search_tags = ndb.StringProperty(repeated=True)
   feature_notes = ndb.TextProperty()  # copy from comments
+  web_feature = ndb.StringProperty()
 
   # Metadata: Process information
-  feature_type = ndb.IntegerProperty(default=FEATURE_TYPE_INCUBATE_ID)
+  feature_type = ndb.IntegerProperty(required=True, default=FEATURE_TYPE_INCUBATE_ID)
   intent_stage = ndb.IntegerProperty(default=INTENT_NONE)
   active_stage_id = ndb.IntegerProperty()
   bug_url = ndb.StringProperty()  # Tracking bug
   launch_bug_url = ndb.StringProperty()  # FLT or go/launch
+  screenshot_links = ndb.StringProperty(repeated=True)
+  first_enterprise_notification_milestone = ndb.IntegerProperty()
+  enterprise_impact = ndb.IntegerProperty(default=ENTERPRISE_IMPACT_NONE)
   breaking_change = ndb.BooleanProperty(default=False)
+  confidential = ndb.BooleanProperty(default=False)
+  shipping_year = ndb.IntegerProperty()
 
   # Implementation in Chrome
-  impl_status_chrome = ndb.IntegerProperty(required=True, default=NO_ACTIVE_DEV)
+  impl_status_chrome = ndb.IntegerProperty(required=True, default=PROPOSED)
   flag_name = ndb.StringProperty()
+  finch_name = ndb.StringProperty()
+  non_finch_justification = ndb.TextProperty()
   ongoing_constraints = ndb.TextProperty()
 
-  # Gate: Adoption
+  # Topic: Adoption (reviewed by API Owners.  Auto-approved gate later?)
   motivation = ndb.TextProperty()
   devtrial_instructions = ndb.TextProperty()
   activation_risks = ndb.TextProperty()
   measurement = ndb.TextProperty()
+  availability_expectation = ndb.TextProperty()
+  adoption_expectation = ndb.TextProperty()
+  adoption_plan = ndb.TextProperty()
 
   # Gate: Standardization & Interop
   initial_public_proposal_url = ndb.StringProperty()
@@ -359,6 +139,7 @@ class FeatureEntry(ndb.Model):  # Copy from Feature
   all_platforms_descr = ndb.TextProperty()
   tag_review = ndb.StringProperty()
   tag_review_status = ndb.IntegerProperty(default=REVIEW_PENDING)
+  tag_review_resolution: Optional[ReviewResultProperty] = ReviewResultProperty()
   non_oss_deps = ndb.TextProperty()
   anticipated_spec_changes = ndb.TextProperty()
 
@@ -366,12 +147,34 @@ class FeatureEntry(ndb.Model):  # Copy from Feature
   safari_views = ndb.IntegerProperty(required=True, default=NO_PUBLIC_SIGNALS)
   web_dev_views = ndb.IntegerProperty(required=True, default=DEV_NO_SIGNALS)
   ff_views_link = ndb.StringProperty()
+  ff_views_link_result: Optional[ReviewResultProperty] = ReviewResultProperty()
   safari_views_link = ndb.StringProperty()
+  safari_views_link_result: Optional[ReviewResultProperty] = ReviewResultProperty()
   web_dev_views_link = ndb.StringProperty()
   ff_views_notes = ndb.StringProperty()
   safari_views_notes = ndb.TextProperty()
   web_dev_views_notes = ndb.TextProperty()
   other_views_notes = ndb.TextProperty()
+
+  @ndb.ComputedProperty
+  def has_open_tag_review(self):
+    return self.tag_review is not None and self.tag_review_resolution is None
+
+  @ndb.ComputedProperty
+  def has_open_ff_review(self):
+    return (
+      self.ff_views not in [IN_DEV, SHIPPED, SIGNALS_NA]
+      and self.ff_views_link is not None
+      and self.ff_views_link_result is None
+    )
+
+  @ndb.ComputedProperty
+  def has_open_safari_review(self):
+    return (
+      self.safari_views not in [IN_DEV, SHIPPED, SIGNALS_NA]
+      and self.safari_views_link is not None
+      and self.safari_views_link_result is None
+    )
 
   # Gate: Security & Privacy
   security_risks = ndb.TextProperty()
@@ -393,7 +196,14 @@ class FeatureEntry(ndb.Model):  # Copy from Feature
   # Legacy fields that we display on old entries, but don't allow editing.
   experiment_timeline = ndb.TextProperty()  # Display-only
 
+  # The prefix of rediscache keys for storing all information
+  # about a feature.
   DEFAULT_CACHE_KEY = 'FeatureEntries'
+  # The prefix of rediscache keys for storing the feature name
+  # of a feature.
+  FEATURE_NAME_CACHE_KEY = 'FeatureNames'
+  # The prefix used when cacheing entire search results.
+  SEARCH_CACHE_KEY = 'FeatureSearch'
 
   def __init__(self, *args, **kwargs):
     # Initialise Feature.blink_components with a default value.  If
@@ -410,10 +220,6 @@ class FeatureEntry(ndb.Model):  # Copy from Feature
   def feature_cache_key(cls, cache_key, feature_id):
     return '%s|%s' % (cache_key, feature_id)
 
-  @classmethod
-  def feature_cache_prefix(cls):
-    return '%s|*' % (cls.DEFAULT_CACHE_KEY)
-
   def put(self, **kwargs) -> Any:
     key = super(FeatureEntry, self).put(**kwargs)
     # Invalidate rediscache for the individual feature view.
@@ -421,12 +227,17 @@ class FeatureEntry(ndb.Model):  # Copy from Feature
         FeatureEntry.DEFAULT_CACHE_KEY, self.key.integer_id())
     rediscache.delete(cache_key)
 
+    # Invalidate rediscache for the individual feature name.
+    cache_key = FeatureEntry.feature_cache_key(
+        FeatureEntry.FEATURE_NAME_CACHE_KEY, self.key.integer_id())
+    rediscache.delete(cache_key)
+    rediscache.delete_keys_with_prefix(FeatureEntry.SEARCH_CACHE_KEY)
+
     return key
 
   # Note: get_in_milestone will be in a new file legacy_queries.py.
 
 
-# Note: This class is not used yet.
 class MilestoneSet(ndb.Model):  # copy from milestone fields of Feature
   """Range of milestones during which a feature will be in a certain stage."""
 
@@ -441,8 +252,6 @@ class MilestoneSet(ndb.Model):  # copy from milestone fields of Feature
       'ot_milestone_desktop_end': 'desktop_last',
       'ot_milestone_android_start': 'android_first',
       'ot_milestone_android_end': 'android_last',
-      'ot_milestone_ios_start': 'ios_first',
-      'ot_milestone_ios_end': 'ios_last',
       'ot_milestone_webview_start': 'webview_first',
       'ot_milestone_webview_end': 'webview_last',
       'dt_milestone_desktop_start': 'desktop_first',
@@ -450,7 +259,7 @@ class MilestoneSet(ndb.Model):  # copy from milestone fields of Feature
       'dt_milestone_ios_start': 'ios_first',
       'dt_milestone_webview_start': 'webview_first',
     }
-  
+
   # List of milestone fields relevant to the origin trial stage types.
   OT_MILESTONE_FIELD_NAMES = [
     {'old': 'ot_milestone_desktop_start', 'new': 'desktop_first'},
@@ -493,12 +302,12 @@ class MilestoneSet(ndb.Model):  # copy from milestone fields of Feature
   webview_last = ndb.IntegerProperty()
 
 
-# Note: This class is not used yet.
 class Stage(ndb.Model):
   """A stage of a feature's development."""
   # Identifying information: what.
   feature_id = ndb.IntegerProperty(required=True)
   stage_type = ndb.IntegerProperty(required=True)
+  display_name = ndb.StringProperty()
 
   # Pragmatic information: where and when.
   browser = ndb.StringProperty()  # Blank or "Chrome" for now.
@@ -512,20 +321,47 @@ class Stage(ndb.Model):
   te_emails = ndb.StringProperty(repeated=True)
 
   # Gate-related fields that need separate values for repeated stages.
-  # copy from Feature.
-  experiment_goals = ndb.TextProperty()
-  experiment_risks = ndb.TextProperty()
+  announcement_url = ndb.StringProperty()
   experiment_extension_reason = ndb.TextProperty()
   intent_thread_url = ndb.StringProperty()
+  intent_subject_line = ndb.StringProperty()
+
+  # Origin trial fields
+  origin_trial_id = ndb.StringProperty()
   origin_trial_feedback_url = ndb.StringProperty()
-  announcement_url = ndb.StringProperty()
+  experiment_goals = ndb.TextProperty()
+  experiment_risks = ndb.TextProperty()
+  ot_action_requested = ndb.BooleanProperty(default=False)
+  ot_activation_date = ndb.DateProperty()
+  ot_approval_buganizer_component = ndb.IntegerProperty()
+  ot_approval_buganizer_custom_field_id = ndb.IntegerProperty()
+  ot_approval_criteria_url = ndb.StringProperty()
+  ot_approval_group_email = ndb.StringProperty()
+  ot_chromium_trial_name = ndb.StringProperty()
+  ot_description = ndb.TextProperty()
+  ot_display_name = ndb.StringProperty()
+  ot_documentation_url = ndb.StringProperty()
+  ot_emails = ndb.StringProperty(repeated=True)
+  ot_feedback_submission_url = ndb.StringProperty()
+  ot_has_third_party_support = ndb.BooleanProperty(default=False)
+  ot_is_critical_trial = ndb.BooleanProperty(default=False)
+  ot_is_deprecation_trial = ndb.BooleanProperty(default=False)
+  ot_owner_email = ndb.StringProperty()
+  ot_request_note = ndb.TextProperty()  # Deprecated.
+  ot_require_approvals = ndb.BooleanProperty(default=False)
+  ot_setup_status = ndb.IntegerProperty()
+  ot_use_counter_bucket_number = ndb.IntegerProperty()
+  ot_webfeature_use_counter = ndb.StringProperty()
+
   # Origin trial stage id that this stage extends, if trial extension stage.
   ot_stage_id = ndb.IntegerProperty()
 
   #Enterprise
+  rollout_impact = ndb.IntegerProperty(default=2) # default to "Medium impact"
   rollout_milestone = ndb.IntegerProperty()
   rollout_platforms = ndb.StringProperty(repeated=True)
   rollout_details = ndb.TextProperty()
   enterprise_policies = ndb.StringProperty(repeated=True)
 
   archived = ndb.BooleanProperty(default=False)
+  created = ndb.DateTimeProperty(auto_now_add=True)

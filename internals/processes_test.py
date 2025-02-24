@@ -24,7 +24,7 @@ from internals import processes
 from internals import stage_helpers
 
 
-BakeApproval = approval_defs.ApprovalFieldDef(
+BakeGateInfo = approval_defs.GateInfo(
     'Approval for baking',
     'The head chef must approve of you using the oven',
     9, approval_defs.ONE_LGTM, ['chef@example.com'], 'Chef')
@@ -32,10 +32,13 @@ BakeApproval = approval_defs.ApprovalFieldDef(
 BAKE_APPROVAL_DEF_DICT = collections.OrderedDict([
     ('name', 'Approval for baking'),
     ('team_name', 'Chef'),
+    ('escalation_email', None),
     ('description', 'The head chef must approve of you using the oven'),
-    ('field_id', 9),
+    ('gate_type', 9),
     ('rule', approval_defs.ONE_LGTM),
     ('approvers', ['chef@example.com']),
+    ('slo_initial_response', 5),
+    ('slo_resolve', 10),
     ])
 
 PI_COLD_DOUGH = processes.ProgressItem('Cold dough', 'dough')
@@ -54,10 +57,10 @@ class HelperFunctionsTest(testing_config.CustomTestCase):
         'Make it before you are hungry',
         [processes.ProcessStage(
             'Make dough',
-            'Mix it and kneed',
+            'Mix it and knead',
             [PI_COLD_DOUGH],
             [processes.Action(
-                'Share kneeding video', 'https://example.com', [])],
+                'Share kneading video', 'https://example.com', [])],
             [],
             0, 1, STAGE_BAKE_DOUGH),
          processes.ProcessStage(
@@ -65,7 +68,7 @@ class HelperFunctionsTest(testing_config.CustomTestCase):
              'Heat at 375 for 40 minutes',
              [PI_LOAF, PI_DIRTY_PAN],
              [],
-             [BakeApproval],
+             [BakeGateInfo],
              1, 2, STAGE_BAKE_BAKE),
          ])
     expected = {
@@ -74,10 +77,10 @@ class HelperFunctionsTest(testing_config.CustomTestCase):
         'applicability': 'Make it before you are hungry',
         'stages': [
             {'name': 'Make dough',
-             'description': 'Mix it and kneed',
+             'description': 'Mix it and knead',
              'progress_items': [{'name': 'Cold dough', 'field': 'dough'}],
              'actions': [{
-                 'name': 'Share kneeding video',
+                 'name': 'Share kneading video',
                  'url': 'https://example.com',
                  'prerequisites': []}],
              'approvals': [],
@@ -206,7 +209,7 @@ class ProgressDetectorsTest(testing_config.CustomTestCase):
     self.assertTrue(detector(self.feature_1, self.stages_dict))
 
   def test_ready_for_trial_email(self):
-    detector = processes.PROGRESS_DETECTORS['Ready for Trial email']
+    detector = processes.PROGRESS_DETECTORS['Ready for Developer Testing email']
     self.assertFalse(detector(self.feature_1, self.stages_dict))
     self.stages_dict[130][0].announcement_url = 'http://example.com/trial_ready'
     self.assertTrue(detector(self.feature_1, self.stages_dict))
@@ -276,6 +279,13 @@ class ProgressDetectorsTest(testing_config.CustomTestCase):
     detector = processes.PROGRESS_DETECTORS['Code removed']
     self.assertFalse(detector(self.feature_1, self.stages_dict))
     self.feature_1.impl_status_chrome = core_enums.REMOVED
+    self.assertTrue(detector(self.feature_1, self.stages_dict))
+
+  def test_rollout_impact(self):
+    detector = processes.PROGRESS_DETECTORS['Rollout impact']
+    # There is always a value for this
+    self.assertTrue(detector(self.feature_1, self.stages_dict))
+    self.stages_dict[1061][0].rollout_impact = 1
     self.assertTrue(detector(self.feature_1, self.stages_dict))
 
   def test_rollout_milestone(self):
