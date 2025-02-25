@@ -14,33 +14,35 @@
 
 import base64
 import datetime
-import requests
 import testing_config  # Must be imported before the module under test.
-import unittest
-import urllib.request, urllib.parse, urllib.error
 
 from unittest import mock
-import flask
-import werkzeug
 
+from framework import rediscache
 from internals import approval_defs
-from internals.review_models import Approval, Gate, Vote
+from internals import core_enums
+from internals.review_models import Gate, GateDef, Vote, OwnersFile
 
 
 class FetchOwnersTest(testing_config.CustomTestCase):
 
+  FILE_CONTENTS = (
+      '# Blink API owners are responsible for ...\n'
+      '#\n'
+      '# See https://www.chromium.org/blink#new-features for details.\n'
+      'owner1@example.com\n'
+      'owner2@example.com\n'
+      'owner3@example.com\n'
+      '\n')
+
+  def setUp(self):
+    for owners_file in OwnersFile.query():
+      owners_file.key.delete()
+
   @mock.patch('requests.get')
   def test__normal(self, mock_get):
     """We can fetch and parse an OWNERS file.  And reuse cached value."""
-    file_contents = (
-        '# Blink API owners are responsible for ...\n'
-        '#\n'
-        '# See https://www.chromium.org/blink#new-features for details.\n'
-        'owner1@example.com\n'
-        'owner2@example.com\n'
-        'owner3@example.com\n'
-        '\n')
-    encoded = base64.b64encode(file_contents.encode())
+    encoded = base64.b64encode(self.FILE_CONTENTS.encode())
     mock_get.return_value = testing_config.Blank(
         status_code=200,
         content=encoded)
@@ -48,7 +50,7 @@ class FetchOwnersTest(testing_config.CustomTestCase):
     actual = approval_defs.fetch_owners('https://example.com')
     again = approval_defs.fetch_owners('https://example.com')
 
-    # Only called once because second call will be a redis hit.
+    # Only called once because second call will be an ndb hit.
     mock_get.assert_called_once_with('https://example.com')
     self.assertEqual(
         actual,
@@ -57,31 +59,109 @@ class FetchOwnersTest(testing_config.CustomTestCase):
 
   @mock.patch('logging.error')
   @mock.patch('requests.get')
-  def test__error(self, mock_get, mock_err):
-    """If we can't read the OWNER file, raise an exception."""
+  def test__error__use_ndb(self, mock_get, mock_err):
+    """If NDB is old and we can't read the OWNERS file, use old value anyway."""
+    encoded = base64.b64encode(self.FILE_CONTENTS.encode())
+    OwnersFile(
+        url='https://example.com',
+        raw_content=encoded,
+        created_on=datetime.datetime(2022, 1, 1)).put()
     mock_get.return_value = testing_config.Blank(
         status_code=404)
 
-    with self.assertRaises(ValueError):
-      approval_defs.fetch_owners('https://example.com')
+    actual = approval_defs.fetch_owners('https://example.com')
+    self.assertEqual(
+        actual,
+        ['owner1@example.com', 'owner2@example.com', 'owner3@example.com'])
 
-    mock_get.assert_called_once_with('https://example.com')
+  @mock.patch('logging.error')
+  @mock.patch('requests.get')
+  def test__error__use_empty_list(self, mock_get, mock_err):
+    """If NDB is missing and we can't read the OWNERS file, use []."""
+    # Don't create any test existing OwnersFile in NDB.
+    mock_get.return_value = testing_config.Blank(
+        status_code=404)
+
+    actual = approval_defs.fetch_owners('https://example.com')
+    self.assertEqual(actual, [])
+
+
+class AutoAssignmentTest(testing_config.CustomTestCase):
+
+  def setUp(self):
+    self.feature_id = 123456789
+    self.gate_1 = Gate(
+        feature_id=self.feature_id, stage_id=12300, state=0,
+        gate_type=core_enums.GATE_PRIVACY_ORIGIN_TRIAL)
+    self.gate_1.put()
+    self.gate_2 = Gate(
+        feature_id=self.feature_id, stage_id=12399, state=0,
+        gate_type=core_enums.GATE_PRIVACY_SHIP,
+        assignee_emails=['reviewer@example.com'])
+    self.gate_3 = Gate(
+        feature_id=self.feature_id, stage_id=12399, state=0,
+        gate_type=core_enums.GATE_SECURITY_SHIP)
+
+  def test__with_prior_assignment__match(self):
+    """If there was a prior assignement, use it."""
+    self.gate_2.put()
+    approval_defs.auto_assign_reviewer(self.gate_1)
+    self.assertEqual(['reviewer@example.com'], self.gate_1.assignee_emails)
+
+  def test__with_prior_assignment__wrong_rule(self):
+    """If there was a prior assignement, but a different rule, bail."""
+    self.gate_1.gate_type = core_enums.GATE_API_SHIP
+    self.gate_1.put()
+    self.gate_2.gate_type = core_enums.GATE_API_ORIGIN_TRIAL  # Different rule
+    self.gate_2.put()
+    approval_defs.auto_assign_reviewer(self.gate_1)
+    self.assertEqual([], self.gate_1.assignee_emails)
+
+  def test__no_prior_assignment__no_gate_def(self):
+    """If there is no prior assigned and members are not in NDB, bail."""
+    # Note that gate_2 and gate_3 not saved to NDB.
+    approval_defs.auto_assign_reviewer(self.gate_1)
+    self.assertEqual([], self.gate_1.assignee_emails)
+
+    self.gate_2.assignee_emails = []
+    self.gate_2.put()  # Same team, but it has not assignement.
+    self.assertEqual([], self.gate_1.assignee_emails)
+
+    self.gate_3.put()  # Gate for a different team
+    self.assertEqual([], self.gate_1.assignee_emails)
 
 
 
 MOCK_APPROVALS_BY_ID = {
-    1: approval_defs.ApprovalFieldDef(
+    1: approval_defs.GateInfo(
         'Intent to test',
         'You need permission to test',
-        1, approval_defs.ONE_LGTM, ['approver@example.com']),
-    2: approval_defs.ApprovalFieldDef(
+        1, approval_defs.ONE_LGTM, ['approver@example.com'], 'API Owners'),
+    2: approval_defs.GateInfo(
         'Intent to optimize',
         'You need permission to optimize',
-        2, approval_defs.THREE_LGTM, 'https://example.com'),
+        2, approval_defs.THREE_LGTM, 'https://example.com', 'API Owners'),
+    3: approval_defs.GateInfo(
+        'Intent to memorize',
+        'You need permission to memorize',
+        3, approval_defs.THREE_LGTM, approval_defs.IN_NDB, 'API Owners'),
 }
 
 
 class GetApproversTest(testing_config.CustomTestCase):
+
+  def setUp(self):
+    self.clearCache()
+
+  def tearDown(self):
+    self.clearCache()
+    for gate_def in GateDef.query():
+      gate_def.key.delete()
+
+  def clearCache(self):
+    for gate_type in approval_defs.APPROVAL_FIELDS_BY_ID:
+      cache_key = '%s|%s' % (approval_defs.APPROVERS_CACHE_KEY, gate_type)
+      rediscache.delete(cache_key)
 
   @mock.patch('internals.approval_defs.APPROVAL_FIELDS_BY_ID',
               MOCK_APPROVALS_BY_ID)
@@ -102,40 +182,68 @@ class GetApproversTest(testing_config.CustomTestCase):
     mock_fetch_owner.assert_called_once_with('https://example.com')
     self.assertEqual(actual, ['owner@example.com'])
 
+  @mock.patch('internals.approval_defs.APPROVAL_FIELDS_BY_ID',
+              MOCK_APPROVALS_BY_ID)
+  @mock.patch('internals.approval_defs.fetch_owners')
+  def test__ndb_new(self, mock_fetch_owner):
+    """Some approvals will have approvers in NDB, but they are not found."""
+    actual = approval_defs.get_approvers(3)
+    mock_fetch_owner.assert_not_called()
+    self.assertEqual(actual, [])
+    updated_gate_defs = GateDef.query().fetch()
+    self.assertEqual(1, len(updated_gate_defs))
+    self.assertEqual(3, updated_gate_defs[0].gate_type)
+    self.assertEqual([], updated_gate_defs[0].approvers)
 
-class IsValidFieldIdTest(testing_config.CustomTestCase):
+  @mock.patch('internals.approval_defs.APPROVAL_FIELDS_BY_ID',
+              MOCK_APPROVALS_BY_ID)
+  @mock.patch('internals.approval_defs.fetch_owners')
+  def test__ndb_existing(self, mock_fetch_owner):
+    """Some approvals will have approvers in NDB, use it if found."""
+    gate_def_3 = GateDef(gate_type=3, approvers=['a', 'b'])
+    gate_def_3.put()
+    actual = approval_defs.get_approvers(3)
+    mock_fetch_owner.assert_not_called()
+    self.assertEqual(actual, ['a', 'b'])
+    existing_gate_defs = GateDef.query().fetch()
+    self.assertEqual(1, len(existing_gate_defs))
+    self.assertEqual(3, existing_gate_defs[0].gate_type)
+    self.assertEqual(['a', 'b'], existing_gate_defs[0].approvers)
+
+
+class IsValidGateTypeTest(testing_config.CustomTestCase):
 
   @mock.patch('internals.approval_defs.APPROVAL_FIELDS_BY_ID',
               MOCK_APPROVALS_BY_ID)
   def test(self):
-    """We know if a field_id is defined or not."""
-    self.assertTrue(approval_defs.is_valid_field_id(1))
-    self.assertTrue(approval_defs.is_valid_field_id(2))
-    self.assertFalse(approval_defs.is_valid_field_id(3))
+    """We know if a gate_type is defined or not."""
+    self.assertTrue(approval_defs.is_valid_gate_type(1))
+    self.assertTrue(approval_defs.is_valid_gate_type(2))
+    self.assertFalse(approval_defs.is_valid_gate_type(99))
 
 
 class IsApprovedTest(testing_config.CustomTestCase):
 
   def setUp(self):
     feature_1_id = 123456
-    self.appr_nr = Approval(
-        feature_id=feature_1_id, field_id=1,
-        state=Approval.REVIEW_REQUESTED,
+    self.appr_nr = Vote(
+        feature_id=feature_1_id, gate_type=1,
+        state=Vote.REVIEW_REQUESTED,
         set_on=datetime.datetime.now(),
         set_by='one@example.com')
-    self.appr_na = Approval(
-        feature_id=feature_1_id, field_id=1,
-        state=Approval.NA,
+    self.appr_na = Vote(
+        feature_id=feature_1_id, gate_type=1,
+        state=Vote.NA,
         set_on=datetime.datetime.now(),
         set_by='one@example.com')
-    self.appr_no = Approval(
-        feature_id=feature_1_id, field_id=1,
-        state=Approval.DENIED,
+    self.appr_no = Vote(
+        feature_id=feature_1_id, gate_type=1,
+        state=Vote.DENIED,
         set_on=datetime.datetime.now(),
         set_by='two@example.com')
-    self.appr_yes = Approval(
-        feature_id=feature_1_id, field_id=1,
-        state=Approval.APPROVED,
+    self.appr_yes = Vote(
+        feature_id=feature_1_id, gate_type=1,
+        state=Vote.APPROVED,
         set_on=datetime.datetime.now(),
         set_by='three@example.com')
 
@@ -215,6 +323,8 @@ DN = Vote.DENIED
 NW = Vote.NEEDS_WORK
 RS = Vote.REVIEW_STARTED
 NA = Vote.NA
+IR = Vote.INTERNAL_REVIEW
+NA_SELF = Vote.NA_SELF
 GATE_VALUES= Vote.VOTE_VALUES.copy()
 GATE_VALUES.update({Gate.PREPARING: 'preparing'})
 
@@ -244,6 +354,11 @@ class CalcGateStateTest(testing_config.CustomTestCase):
     self.assertEqual(('approved', 'review_requested'),
                      self.do_calc(RR, AP))
 
+  def test_request_one_approved__no_request(self):
+    """An API Owner gave LGTM1 Approval on an intent that was not detected."""
+    self.assertEqual(('approved', 'review_requested'),
+                     self.do_calc(AP))
+
   def test_request_three_approved(self):
     """The user has requested a review and it got 3 approvals."""
     self.assertEqual(('approved', 'approved'),
@@ -257,6 +372,15 @@ class CalcGateStateTest(testing_config.CustomTestCase):
                      self.do_calc(RR, RS, NW))
     self.assertEqual(('needs_work', 'needs_work'),
                      self.do_calc(RR, NW, NW))
+
+  def test_request_internal_review(self):
+    """Owner requested a review and a reviewer opts for internal review."""
+    self.assertEqual(('internal_review', 'internal_review'),
+                     self.do_calc(RR, IR))
+    self.assertEqual(('internal_review', 'internal_review'),
+                     self.do_calc(RR, RS, IR))
+    self.assertEqual(('internal_review', 'internal_review'),
+                     self.do_calc(RR, NW, IR))
 
   def test_request_disagreement(self):
     """Reviewers may have different opinions, needed LGTMs counted."""
@@ -295,11 +419,32 @@ class CalcGateStateTest(testing_config.CustomTestCase):
     self.assertEqual(('approved', 'approved'),
                      self.do_calc(AP, AP, RS, AP))
 
+  def test_self_cert_stands(self):
+    """A feature owner self-certified and no one disagrees."""
+    self.assertEqual(('na', 'preparing'),
+                     self.do_calc(NA_SELF))
+    self.assertEqual(('na', 'review_requested'),
+                     self.do_calc(NA_SELF, NA))
+    self.assertEqual(('approved', 'review_requested'),
+                     self.do_calc(NA_SELF, AP))
+
+  def test_self_cert_reversed(self):
+    """A feature owner self-certified but a reviewer disagreed."""
+    self.assertEqual(('needs_work', 'needs_work'),
+                     self.do_calc(NA_SELF, NW))
+    self.assertEqual(('review_started', 'review_started'),
+                     self.do_calc(NA_SELF, RS))
+    self.assertEqual(('internal_review', 'internal_review'),
+                     self.do_calc(NA_SELF, IR))
+    self.assertEqual(('denied', 'denied'),
+                     self.do_calc(NA_SELF, DN))
+
 
 class UpdateTest(testing_config.CustomTestCase):
 
   def setUp(self):
-    self.gate_1 = Gate(feature_id=1, stage_id=1, gate_type=2, state=Vote.APPROVED)
+    self.gate_1 = Gate(
+        id=1001, feature_id=1, stage_id=1, gate_type=2, state=Gate.PREPARING)
     self.gate_1.put()
     gate_id = self.gate_1.key.integer_id()
     self.votes = []
@@ -319,8 +464,8 @@ class UpdateTest(testing_config.CustomTestCase):
         state=Vote.REVIEW_REQUESTED, set_on=datetime.datetime(2020, 1, 2),
         set_by='user5@example.com'))
 
-    self.gate_2 = Gate(feature_id=2, stage_id=2, gate_type=2,
-        state=Vote.APPROVED)
+    self.gate_2 = Gate(
+        id=1002, feature_id=2, stage_id=2, gate_type=2, state=Vote.APPROVED)
     self.gate_2.put()
     gate_id = self.gate_2.key.integer_id()
     self.votes.append(Vote(feature_id=1, gate_id=gate_id,
@@ -362,14 +507,25 @@ class UpdateTest(testing_config.CustomTestCase):
 
   def test_update_approval_stage__needs_update(self):
     """Gate's approval state will be updated based on votes."""
-    # Gate 1 should evaluate to not approved after updating.
-    self.assertEqual(
-        approval_defs.update_gate_approval_state(self.gate_1), Vote.APPROVED)
+    # Gate 1 should evaluate to approved after updating.
+    votes = Vote.get_votes(gate_id=self.gate_1.key.integer_id())
+    self.assertTrue(
+        approval_defs.update_gate_approval_state(self.gate_1, votes))
     self.assertEqual(self.gate_1.state, Vote.APPROVED)
 
   def test_update_approval_state__no_change(self):
     """Gate's approval state does not change unless it needs to."""
     # Gate 2 is already marked as approved and should not change.
-    self.assertEqual(
-        approval_defs.update_gate_approval_state(self.gate_2), Vote.APPROVED)
+    votes = Vote.get_votes(gate_id=self.gate_2.key.integer_id())
+    self.assertFalse(
+        approval_defs.update_gate_approval_state(self.gate_2, votes))
     self.assertEqual(self.gate_2.state, Vote.APPROVED)
+
+  def test_update_approval_state__unsupported_gate_type(self):
+    """If we don't recognize the gate type, assume rule ONE_LGTM."""
+    self.gate_1.gate_type = 999
+    # Gate 1 should evaluate to approved after updating.
+    votes = Vote.get_votes(gate_id=self.gate_1.key.integer_id())
+    self.assertTrue(
+        approval_defs.update_gate_approval_state(self.gate_1, votes))
+    self.assertEqual(self.gate_1.state, Vote.APPROVED)

@@ -18,7 +18,7 @@ import json
 import logging
 import os
 import re
-from typing import Optional
+from typing import Any, NoReturn, Optional
 
 import flask
 import flask.views
@@ -28,6 +28,7 @@ import google.appengine.api
 from google.cloud import ndb  # type: ignore
 
 import settings
+from api import api_specs
 from framework import csp
 from framework import permissions
 from framework import secrets
@@ -35,18 +36,24 @@ from framework import users
 from framework import utils
 from framework import xsrf
 from internals import approval_defs
-from internals.core_models import FeatureEntry
+from internals import notifier_helpers
 from internals import user_models
+from internals.core_enums import (
+  ALL_ORIGIN_TRIAL_STAGE_TYPES,
+  OT_ACTIVATION_FAILED,
+  OT_CREATION_FAILED,
+  OT_READY_FOR_CREATION)
+from internals.core_models import FeatureEntry, MilestoneSet, Stage
+from internals.data_types import CHANGED_FIELDS_LIST_TYPE
 
-from google.auth.transport import requests
 from flask import session
 from flask import render_template
 from flask_cors import CORS
-import sys
+from gen.py.chromestatus_openapi.chromestatus_openapi.models.base_model import Model
 
 # Our API responses are prefixed with this ro prevent attacks that
 # exploit <script src="...">.  See go/xssi.
-XSSI_PREFIX = ')]}\'\n';
+XSSI_PREFIX = ')]}\'\n'
 
 
 # See https://www.regextester.com/93901 for url regex
@@ -64,7 +71,7 @@ class BaseHandler(flask.views.MethodView):
   def request(self):
     return flask.request
 
-  def abort(self, status, msg=None, **kwargs):
+  def abort(self, status, msg=None, **kwargs) -> NoReturn:
     """Support webapp2-style, e.g., self.abort(400)."""
     if msg:
       if status == 500:
@@ -73,6 +80,7 @@ class BaseHandler(flask.views.MethodView):
         logging.info('Abort %r: %s' % (status, msg))
       flask.abort(status, description=msg, **kwargs)
     else:
+      logging.info('Abort %r' % status)
       flask.abort(status, **kwargs)
 
   def redirect(self, url):
@@ -127,13 +135,21 @@ class BaseHandler(flask.views.MethodView):
     feature_id = (feature_id or
                   self.get_int_param('featureId', required=True))
     # Load feature directly from NDB so as to never get a stale cached copy.
-    feature = FeatureEntry.get_by_id(feature_id)
+    feature: FeatureEntry|None = FeatureEntry.get_by_id(feature_id)
     if not feature:
       self.abort(404, msg='Feature not found')
     user = self.get_current_user()
     if not permissions.can_view_feature(user, feature):
       self.abort(403, msg='Cannot view that feature')
     return feature
+
+  def get_specified_stage(self, stage_id: int|None=None) -> Stage:
+    """Get the stage specified in the stage_id parameter."""
+    stage_id = stage_id or self.get_int_param('stage_id', required=True)
+    stage = Stage.get_by_id(stage_id)
+    if not stage:
+      self.abort(404, msg='Stage not found')
+    return stage
 
   def get_bool_arg(self, name, default=False):
     """Get the specified boolean from the query string."""
@@ -172,15 +188,19 @@ class APIHandler(BaseHandler):
 
   def defensive_jsonify(self, handler_data):
     """Return a Flask Response object with a JSON string prefixed with junk."""
-    body = json.dumps(handler_data)
+    body = json.dumps(handler_data, default=str)
     return flask.current_app.response_class(
         XSSI_PREFIX + body,
-        mimetype=flask.current_app.config['JSONIFY_MIMETYPE'])
+        mimetype=flask.current_app.json.mimetype)
 
   def get(self, *args, **kwargs):
     """Handle an incoming HTTP GET request."""
     headers = self.get_headers()
     handler_data = self.do_get(*args, **kwargs)
+    # OpenAPI models have a to_dict attribute that should be used for
+    # converting to JSON.
+    if hasattr(handler_data, 'to_dict'):
+      handler_data = handler_data.to_dict()
     return self.defensive_jsonify(handler_data), headers
 
   def post(self, *args, **kwargs):
@@ -189,12 +209,20 @@ class APIHandler(BaseHandler):
     logging.info('POST data is:')
     for k, v in json_body.items():
       logging.info('%r: %s', k, repr(v)[:settings.MAX_LOG_LINE])
-    is_login_request = str(self.request.url_rule) == '/api/v0/login'
+    is_login_request = str(self.request.url_rule) in (
+        '/api/v0/login', '/dev/mock_login')
 
     if not is_login_request:
       self.require_signed_in_and_xsrf_token()
     headers = self.get_headers()
     handler_data = self.do_post(*args, **kwargs)
+    return self.defensive_jsonify(handler_data), headers
+
+  def put(self, *args, **kwargs):
+    """Handle an incoming HTTP PUT request."""
+    self.require_signed_in_and_xsrf_token()
+    headers = self.get_headers()
+    handler_data = self.do_put(*args, **kwargs)
     return self.defensive_jsonify(handler_data), headers
 
   def patch(self, *args, **kwargs):
@@ -216,6 +244,8 @@ class APIHandler(BaseHandler):
     valid_methods = ['GET']
     if self.do_post.__code__ is not APIHandler.do_post.__code__:
       valid_methods.append('POST')
+    if self.do_put.__code__ is not APIHandler.do_put.__code__:
+      valid_methods.append('PUT')
     if self.do_patch.__code__ is not APIHandler.do_patch.__code__:
       valid_methods.append('PATCH')
     if self.do_delete.__code__ is not APIHandler.do_delete.__code__:
@@ -244,6 +274,10 @@ class APIHandler(BaseHandler):
     """Subclasses should implement this method to handle a POST request."""
     self.abort(405, valid_methods=self._get_valid_methods())
 
+  def do_put(self, **kwargs):
+    """Subclasses should implement this method to handle a PUT request."""
+    self.abort(405, valid_methods=self._get_valid_methods())
+
   def do_patch(self, **kwargs):
     """Subclasses should implement this method to handle a PATCH request."""
     self.abort(405, valid_methods=self._get_valid_methods())
@@ -260,8 +294,6 @@ class APIHandler(BaseHandler):
   def require_signed_in_and_xsrf_token(self):
     """Every API POST, PUT, or DELETE must be signed in with an XSRF token."""
     user = self.get_current_user(required=True)
-    if not user:
-      self.abort(403, msg='Sign in required')
     token = self.request.headers.get('X-Xsrf-Token')
     if not token:
       try:
@@ -274,6 +306,150 @@ class APIHandler(BaseHandler):
       self.validate_token(token, user.email())
     except xsrf.TokenIncorrect:
       self.abort(400, msg='Invalid XSRF token')
+
+
+class EntitiesAPIHandler(APIHandler):
+  """Base class for APIs that handle changes to entities."""
+
+  def abort_invalid_data_type(
+      self, field: str, field_type: str, value: Any) -> None:
+    """Abort the process if an invalid data type is given."""
+    self.abort(400, msg=(
+        f'Bad value for field {field} of type {field_type}: {value}'))
+
+  def extract_link(self, s):
+    if s:
+      match_obj = URL_RE.search(str(s))
+      if match_obj and match_obj.group('scheme') in ALLOWED_SCHEMES:
+        link = match_obj.group()
+        if not link.startswith(('http://', 'https://')):
+          link = 'http://' + link
+        return link
+    return None
+
+  def split_list_input(
+      self,
+      field: str,
+      field_type: str,
+      value: str,
+      delimiter: str='\\r?\\n'
+    ) -> list[str]:
+    try:
+      formatted_list = [
+        x.strip() for x in re.split(delimiter, value) if x.strip()]
+    except TypeError:
+      self.abort_invalid_data_type(field, field_type, value)
+    return formatted_list
+
+  def update_field_value(
+      self,
+      entity: FeatureEntry | MilestoneSet | Stage,
+      field: str,
+      field_type: str,
+      value: Any
+    ) -> None:
+    new_value = self.format_field_val(field, field_type, value)
+    setattr(entity, field, new_value)
+
+  def update_stage(
+      self,
+      stage: Stage,
+      change_info: dict[str, Any],
+      changed_fields: CHANGED_FIELDS_LIST_TYPE,
+    ) -> bool:
+    """Update stage fields with changes provided."""
+    stage_was_updated = False
+    ot_action_requested = False
+
+    mutating_ot_milestones = any(
+        isinstance(v, dict) and (
+        v['form_field_name'] == 'ot_milestone_desktop_start' or
+        v['form_field_name'] == 'ot_milestone_desktop_end')
+        for v in change_info.values())
+    ot_creation_in_progress =  (
+        stage.ot_setup_status == OT_READY_FOR_CREATION or
+        stage.ot_setup_status == OT_CREATION_FAILED or
+        stage.ot_setup_status == OT_ACTIVATION_FAILED)
+    if mutating_ot_milestones and ot_creation_in_progress:
+      self.abort(400,
+                 'Cannot edit OT milestones while creation is in progress.')
+
+    # Update stage fields.
+    for field, field_type in api_specs.STAGE_FIELD_DATA_TYPES:
+      if field not in change_info or change_info[field] is None:
+        continue
+      form_field_name = change_info[field]['form_field_name']
+      if form_field_name == 'ot_action_requested':
+        ot_action_requested = True
+      old_value = getattr(stage, field)
+
+      new_value = change_info[field].get('value')
+      self.update_field_value(stage, field, field_type, new_value)
+      changed_fields.append((form_field_name, old_value, new_value))
+      stage_was_updated = True
+
+    # Update milestone fields.
+    milestones = stage.milestones
+    for field, field_type in api_specs.MILESTONESET_FIELD_DATA_TYPES:
+      if field not in change_info or change_info[field] is None:
+        continue
+      if milestones is None:
+        milestones = MilestoneSet()
+      form_field_name = change_info[field]['form_field_name']
+      old_value = getattr(milestones, field)
+      new_value = change_info[field].get('value')
+      self.update_field_value(milestones, field, field_type, new_value)
+      changed_fields.append((form_field_name, old_value, new_value))
+      stage_was_updated = True
+    stage.milestones = milestones
+
+    if stage_was_updated:
+      stage.put()
+
+    # Notify of OT creation request if one was sent.
+    # This notification is for non-automated OT creation only.
+    if (ot_action_requested and
+        stage.stage_type in ALL_ORIGIN_TRIAL_STAGE_TYPES):
+      notifier_helpers.send_ot_creation_notification(stage)
+
+    return stage_was_updated
+
+  def format_field_val(
+      self,
+      field: str,
+      field_type: str,
+      value: Any,
+    ) -> str | int | bool | list | None:
+    """Format the given feature value based on the field type."""
+
+    # If the field is empty, no need to format.
+    if value is None:
+      return None
+
+    # TODO(DanielRyanSmith): Write checks to ensure enum values are valid.
+    if field_type == 'emails' or field_type == 'split_str':
+      list_val = self.split_list_input(field, field_type, value, ',')
+      if field == 'blink_components' and len(value) == 0:
+        return [settings.DEFAULT_COMPONENT]
+      return list_val
+    elif field_type == 'link':
+      return self.extract_link(value)
+    elif field_type == 'links':
+      list_val = self.split_list_input(field, field_type, value)
+      # Filter out any URLs that do not conform to the proper pattern.
+      return [self.extract_link(link)
+              for link in list_val if link]
+    elif field_type == 'int':
+      # Int fields can be unset by giving null or nothing in the input field.
+      if value == '' or value is None:
+        return None
+      try:
+        return int(value)
+      except ValueError:
+        self.abort_invalid_data_type(field, field_type, value)
+    elif field_type == 'bool':
+      return bool(value)
+    return str(value)
 
 
 class FlaskHandler(BaseHandler):
@@ -329,6 +505,7 @@ class FlaskHandler(BaseHandler):
     app_version = os.environ.get('GAE_VERSION', 'Undeployed')
     common_data = {
       'prod': settings.PROD,
+      'DEV_MODE': settings.DEV_MODE,
       'APP_TITLE': settings.APP_TITLE,
       'google_sign_in_client_id': settings.GOOGLE_SIGN_IN_CLIENT_ID,
       'current_path': current_path,
@@ -340,13 +517,11 @@ class FlaskHandler(BaseHandler):
 
     user = self.get_current_user()
     if user:
-      field_id = approval_defs.ShipApproval.field_id
-      approvers = approval_defs.get_approvers(field_id)
+      gate_type = approval_defs.ShipApproval.gate_type
+      approvers = approval_defs.get_approvers(gate_type)
       user_pref = user_models.UserPref.get_signed_in_user_pref()
       common_data['user'] = {
         'can_create_feature': permissions.can_create_feature(user),
-        'can_approve': permissions.can_approve_feature(
-            user, None, approvers),
         'can_edit_all': permissions.can_edit_any_feature(user),
         'is_admin': permissions.can_admin_site(user),
         'editable_features': [],
@@ -516,6 +691,8 @@ class ConstHandler(FlaskHandler):
   def get_template_data(self, **defaults):
     """Render a template, or return a JSON constant."""
     if defaults.get('require_signin') and not self.get_current_user():
+      if 'loginStatus=False' in self.get_common_data()['current_path']:
+        return {}
       return flask.redirect(settings.LOGIN_PAGE_URL), self.get_headers()
     if 'template_path' in defaults:
       template_path = defaults['template_path']
@@ -525,6 +702,7 @@ class ConstHandler(FlaskHandler):
       return defaults
 
     return flask.jsonify(defaults)
+
 
 def ndb_wsgi_middleware(wsgi_app):
   """Create a new runtime context for cloud ndb for every request"""
@@ -543,30 +721,55 @@ class SPAHandler(FlaskHandler):
   TEMPLATE_PATH = 'spa.html'
 
   def get_template_data(self, **defaults):
-    # Check if the page requires user to sign in
-    if defaults.get('require_signin') and not self.get_current_user():
-      return flask.redirect(settings.LOGIN_PAGE_URL), self.get_headers()
-
-    # Check if the page requires create feature permission
-    if defaults.get('require_create_feature'):
-      redirect_resp = permissions.validate_feature_create_permission(self)
-      if redirect_resp:
-        return redirect_resp
-
-    # Validate the user has edit permissions and redirect if needed.
-    if defaults.get('require_edit_feature'):
-      feature_id = defaults.get('feature_id')
-      if not feature_id:
-        self.abort(500, msg='Cannot get feature ID from the URL')
-      redirect_resp = permissions.validate_feature_edit_permission(
-          self, feature_id)
-      if redirect_resp:
-        return redirect_resp
-
-    return {} # no handler_data needed to be returned
+    return get_spa_template_data(self, defaults)
 
 
-def FlaskApplication(import_name, routes, post_routes, pattern_base='', debug=False):
+def get_spa_template_data(handler_obj, defaults):
+  """Check permissions then let spa.html do its thing."""
+  # Check if the page requires user to sign in
+  if defaults.get('require_signin') and not handler_obj.get_current_user():
+    common_data = handler_obj.get_common_data()
+    if 'loginStatus=False' in common_data['current_path']:
+      return {}
+    return flask.redirect(settings.LOGIN_PAGE_URL), handler_obj.get_headers()
+
+  # Check if the page requires create feature permission
+  if defaults.get('require_create_feature'):
+    redirect_resp = permissions.validate_feature_create_permission(handler_obj)
+    if redirect_resp:
+      return redirect_resp
+
+  # Validate the user has edit permissions and redirect if needed.
+  if defaults.get('require_edit_feature'):
+    feature_id = defaults.get('feature_id')
+    if not feature_id:
+      handler_obj.abort(500, msg='Cannot get feature ID from the URL')
+    redirect_resp = permissions.validate_feature_edit_permission(
+        handler_obj, feature_id)
+    if redirect_resp:
+      return redirect_resp
+
+  # Validate the user has admin permissions and redirect if needed.
+  if defaults.get('require_admin_site'):
+    user = handler_obj.get_current_user()
+    # Should have already done the require_signin check.
+    # If for reason, we don't let's treat it as the main 403 case.
+    if not user or not permissions.can_admin_site(user):
+      handler_obj.abort(403, msg='Cannot perform admin actions')
+
+  # Validate the user has a google or chromium account and redirect if needed.
+  if defaults.get('is_enterprise_page'):
+    user = handler_obj.get_current_user()
+    # Should have already done the require_signin check.
+    # If for reason, we don't let's treat it as the main 403 case.
+    if not user or not permissions.is_google_or_chromium_account(user):
+      handler_obj.abort(403, msg='You cannot access this page')
+
+  return {} # no handler_data needed to be returned
+
+
+
+def FlaskApplication(import_name, routes, pattern_base='', debug=False):
   """Make a Flask app and add routes and handlers that work like webapp2."""
 
   app = flask.Flask(import_name,
@@ -580,19 +783,11 @@ def FlaskApplication(import_name, routes, post_routes, pattern_base='', debug=Fa
     app.secret_key = secrets.get_session_secret()  # For flask.session
     app.permanent_session_lifetime = xsrf.REFRESH_TOKEN_TIMEOUT_SEC
 
-  for i, route in enumerate(post_routes):
-    classname = route.handler_class.__name__
-    app.add_url_rule(
-        pattern_base + route.path,
-        endpoint=f'{classname}{i}',  # We don't use it, but it must be unique.
-        view_func=route.handler_class.as_view(classname),
-        methods=["POST"])
-
   for i, route in enumerate(routes):
     classname = route.handler_class.__name__
     app.add_url_rule(
         pattern_base + route.path,
-        endpoint=f'{classname}{i + len(post_routes)}',  # We don't use it, but it must be unique.
+        endpoint=f'{classname}{i}',  # We don't use it, but it must be unique.
         view_func=route.handler_class.as_view(classname),
         defaults=route.defaults)
 
@@ -602,6 +797,10 @@ def FlaskApplication(import_name, routes, post_routes, pattern_base='', debug=Fa
   app.config["TRAP_BAD_REQUEST_ERRORS"] = settings.DEV_MODE
   # Flask apps also have a debug setting that can be used to auto-reload
   # template source code. TODO: investigate using the setting.
+
+
+  # Reject any huge POSTs
+  app.config['MAX_CONTENT_LENGTH'] = settings.MAX_REQUEST_CONTENT_LENGTH
 
   # Set the CORS HEADERS.
   CORS(app, resources={r'/data/*': {'origins': '*'}})
