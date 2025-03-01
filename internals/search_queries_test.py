@@ -18,16 +18,17 @@ import datetime
 from unittest import mock
 
 from internals import core_enums
-from internals import core_models
-from internals import review_models
+from internals.core_models import FeatureEntry, MilestoneSet, Stage
+from internals.review_models import Gate, Vote
 from internals import search
+from internals import search_fulltext
 from internals import search_queries
 
 
 class SearchFeaturesTest(testing_config.CustomTestCase):
 
   def setUp(self):
-    self.feature_1 = core_models.FeatureEntry(
+    self.feature_1 = FeatureEntry(
         name='feature a', summary='sum',
         category=1, impl_status_chrome=3)
     self.feature_1.owner_emails = ['owner@example.com']
@@ -35,115 +36,195 @@ class SearchFeaturesTest(testing_config.CustomTestCase):
     self.feature_1.cc_emails = ['cc@example.com']
     self.feature_1.put()
     self.feature_1_id = self.feature_1.key.integer_id()
+    search_fulltext.index_feature(self.feature_1)
 
-    self.stage_1_ship = core_models.Stage(
-        feature_id=self.feature_1_id,
-        stage_type=core_enums.STAGE_BLINK_SHIPPING,
-        milestones=core_models.MilestoneSet(desktop_first=99))
+    self.stage_1_ship = Stage(
+      feature_id=self.feature_1_id,
+      stage_type=core_enums.STAGE_BLINK_SHIPPING,
+      milestones=MilestoneSet(desktop_first=99, android_first=100),
+    )
     self.stage_1_ship.put()
 
-    self.feature_2 = core_models.FeatureEntry(
-        name='feature b', summary='sum', owner_emails=['owner@example.com'],
-        category=1, impl_status_chrome=3)
+    self.feature_2 = FeatureEntry(
+      name='feature b',
+      summary='summary of editor stuff',
+      owner_emails=['owner@example.com'],
+      category=1,
+      impl_status_chrome=3,
+      accurate_as_of=datetime.datetime(2023, 6, 1),
+    )
     self.feature_2.put()
+    search_fulltext.index_feature(self.feature_1)
     self.feature_2_id = self.feature_2.key.integer_id()
+    self.stage_2_ot = Stage(
+      feature_id=self.feature_2_id,
+      stage_type=core_enums.STAGE_BLINK_ORIGIN_TRIAL,
+      milestones=MilestoneSet(desktop_first=89, desktop_last=95, webview_first=100),
+    )
+    self.stage_2_ot.put()
 
-    self.feature_3 = core_models.FeatureEntry(
-        name='feature c', summary='sum', owner_emails=['random@example.com'],
-        category=1, impl_status_chrome=4)
+    self.feature_3 = FeatureEntry(
+      name='feature c',
+      summary='sum',
+      owner_emails=['random@example.com'],
+      category=1,
+      impl_status_chrome=4,
+      accurate_as_of=datetime.datetime(2024, 6, 1),
+    )
     self.feature_3.put()
     self.feature_3_id = self.feature_3.key.integer_id()
 
-    self.gate_1 = review_models.Gate(
+    self.gate_1 = Gate(
         feature_id=self.feature_1_id, stage_id=1,
-        gate_type=core_models.GATE_API_PROTOTYPE,
-        state=review_models.Vote.APPROVED,
+        gate_type=core_enums.GATE_API_PROTOTYPE,
+        state=Vote.APPROVED,
         requested_on=datetime.datetime(2022, 7, 1))
     self.gate_1.put()
     self.gate_1_id = self.gate_1.key.integer_id()
 
-    self.vote_1_1 = review_models.Vote(
-        feature_id=self.feature_1_id, gate_type=core_models.GATE_API_PROTOTYPE,
+    self.vote_1_1 = Vote(
+        feature_id=self.feature_1_id, gate_type=core_enums.GATE_API_PROTOTYPE,
         gate_id=self.gate_1_id,
-        state=review_models.Vote.REVIEW_REQUESTED,
+        state=Vote.REVIEW_REQUESTED,
         set_on=datetime.datetime(2022, 7, 1),
         set_by='feature_owner@example.com')
     self.vote_1_1.put()
 
-    self.vote_1_2 = review_models.Vote(
-        feature_id=self.feature_1_id, gate_type=core_models.GATE_API_PROTOTYPE,
+    self.vote_1_2 = Vote(
+        feature_id=self.feature_1_id, gate_type=core_enums.GATE_API_PROTOTYPE,
         gate_id=self.gate_1_id,
-        state=review_models.Vote.APPROVED,
+        state=Vote.APPROVED,
         set_on=datetime.datetime(2022, 7, 2),
         set_by='reviewer@example.com')
     self.vote_1_2.put()
 
-    self.gate_2 = review_models.Gate(
+    self.gate_2 = Gate(
         feature_id=self.feature_2_id, stage_id=1,
         gate_type=core_enums.GATE_API_SHIP,
-        state=review_models.Vote.REVIEW_REQUESTED,
+        state=Vote.REVIEW_REQUESTED,
         requested_on=datetime.datetime(2022, 8, 1))
     self.gate_2.put()
     self.gate_2_id = self.gate_2.key.integer_id()
 
-    self.vote_2_1 = review_models.Vote(
+    self.vote_2_1 = Vote(
         feature_id=self.feature_2_id, gate_type=core_enums.GATE_API_SHIP,
         gate_id=self.gate_2_id,
-        state=review_models.Vote.REVIEW_REQUESTED,
+        state=Vote.REVIEW_REQUESTED,
         set_on=datetime.datetime(2022, 8, 1),
         set_by='feature_owner@example.com')
     self.vote_2_1.put()
 
-    self.vote_2_2 = review_models.Vote(
+    self.vote_2_2 = Vote(
         feature_id=self.feature_2_id, gate_type=core_enums.GATE_API_SHIP,
         gate_id=self.gate_2_id,
-        state=review_models.Vote.APPROVED,
+        state=Vote.APPROVED,
         set_on=datetime.datetime(2022, 8, 2),
         set_by='reviewer@example.com')
     self.vote_2_2.put()
 
   def tearDown(self):
-    self.feature_1.key.delete()
-    self.feature_2.key.delete()
-    self.feature_3.key.delete()
-    self.stage_1_ship.key.delete()
-    for gate in review_models.Gate.query():
-      gate.key.delete()
-    for vote in review_models.Vote.query():
-      vote.key.delete()
+    for kind in [
+        FeatureEntry, search_fulltext.FeatureWords, Stage, Gate, Vote]:
+      for entry in kind.query():
+        entry.key.delete()
 
   def test_single_field_query_async__normal(self):
     """We get a promise to run the DB query, which produces results."""
     actual_promise = search_queries.single_field_query_async(
-        'owner', '=', 'owner@example.com')
+        'owner', '=', ['owner@example.com'])
     actual = actual_promise.get_result()
     self.assertCountEqual(
         [self.feature_1_id, self.feature_2_id],
         [key.integer_id() for key in actual])
 
     actual_promise = search_queries.single_field_query_async(
-        'unlisted', '=', True)
+        'unlisted', '=', [True])
     actual = actual_promise.get_result()
     self.assertCountEqual([], actual)
 
     actual_promise = search_queries.single_field_query_async(
-        'deleted', '=', True)
+        'deleted', '=', [True])
     actual = actual_promise.get_result()
     self.assertCountEqual([], actual)
 
   def test_single_field_query_async__multiple_vals(self):
     """We get a promise to run the DB query with multiple values."""
     actual_promise = search_queries.single_field_query_async(
-        'owner', '=', 'owner@example.com,random@example.com')
+        'owner', '=', ['owner@example.com', 'random@example.com'])
     actual = actual_promise.get_result()
     self.assertCountEqual(
         [self.feature_1_id, self.feature_2_id, self.feature_3_id],
         [key.integer_id() for key in actual])
 
+  def test_single_field_query_async__inequality_nulls_first(self):
+    """accurate_as_of treats None as before any comparison value."""
+    actual_promise = search_queries.single_field_query_async(
+      'accurate_as_of', '<', [datetime.datetime(2024, 1, 1)]
+    )
+    actual = actual_promise.get_result()
+    self.assertCountEqual(
+      [self.feature_1_id, self.feature_2_id], [key.integer_id() for key in actual]
+    )
+
+    actual_promise = search_queries.single_field_query_async(
+      'accurate_as_of', '>', [datetime.datetime(2024, 1, 1)]
+    )
+    actual = actual_promise.get_result()
+    self.assertCountEqual([self.feature_3_id], [key.integer_id() for key in actual])
+
+  def test_single_field_query_async__any_start_milestone(self):
+    actual = search_queries.single_field_query_async(
+      'any_start_milestone', '=', [100]
+    ).get_result()
+    self.assertEqual(
+      set([self.feature_1_id, self.feature_2_id]),
+      set(proj.feature_id for proj in actual),
+      'Finds across multiple milestones.',
+    )
+
+    actual = search_queries.single_field_query_async(
+      'any_start_milestone', '=', [95]
+    ).get_result()
+    self.assertEqual(
+      set(), set(proj.feature_id for proj in actual), 'Does not find "last" milestones.'
+    )
+
+    actual = search_queries.single_field_query_async(
+      'any_start_milestone', '=', [search_queries.Interval(97, 99)]
+    ).get_result()
+    self.assertCountEqual(
+      set([self.feature_1_id]),
+      set(proj.feature_id for proj in actual),
+      'Intervals are constrained to a single milestone.',
+    )
+
+  def check_wrong_type(self, field_name, bad_values):
+    with self.assertRaises(ValueError) as cm:
+      search_queries.single_field_query_async(
+          field_name, '=', bad_values)
+    self.assertEqual(
+        cm.exception.args[0], 'Query value does not match field type')
+
+  def test_single_field_query_async__wrong_types(self):
+    """We reject requests with values that parse to the wrong type."""
+    # Feature entry fields
+    self.check_wrong_type('owner', [True])
+    self.check_wrong_type('owner', [123])
+    self.check_wrong_type('deleted', ['not a boolean'])
+    self.check_wrong_type('shipping_year', ['not an integer'])
+    self.check_wrong_type('star_count', ['not an integer'])
+    self.check_wrong_type('created.when', ['not a date'])
+    self.check_wrong_type('owner', ['ok@example.com', True])
+
+    # Stage fields
+    self.check_wrong_type('browsers.chrome.android', ['not an integer'])
+    self.check_wrong_type('finch_url', [123])
+    self.check_wrong_type('finch_url', [True])
+
   def test_single_field_query_async__normal_stage_field(self):
     """We can find a FeatureEntry based on values in an associated Stage."""
     actual_promise = search_queries.single_field_query_async(
-        'browsers.chrome.desktop', '=', 99)
+        'browsers.chrome.desktop', '=', [99])
     actual = actual_promise.get_result()
     self.assertCountEqual(
         [self.feature_1_id],
@@ -152,21 +233,35 @@ class SearchFeaturesTest(testing_config.CustomTestCase):
   def test_single_field_query_async__other_stage_field(self):
     """We only consider the appropriate Stage."""
     actual_promise = search_queries.single_field_query_async(
-        'browsers.chrome.ot.desktop.start', '=', 99)
+        'browsers.chrome.ot.desktop.start', '=', [99])
     actual = actual_promise.get_result()
     self.assertCountEqual([], actual)
 
   def test_single_field_query_async__zero_results(self):
     """When there are no matching results, we get back a promise for []."""
     actual_promise = search_queries.single_field_query_async(
-        'owner', '=', 'nope')
+        'owner', '=', ['nope'])
     actual = actual_promise.get_result()
+    self.assertCountEqual([], actual)
+
+  def test_single_field_query_async__fulltext_in_field(self):
+    """We can search for words within a field."""
+    actual = search_queries.single_field_query_async(
+        'editor', ':', ['editor'])
+    self.assertCountEqual([self.feature_1_id], actual)
+
+    actual = search_queries.single_field_query_async(
+        'editor', ':', ['wrongword'])
+    self.assertCountEqual([], actual)
+
+    actual = search_queries.single_field_query_async(
+        'owner', ':', ['editor'])
     self.assertCountEqual([], actual)
 
   @mock.patch('logging.warning')
   def test_single_field_query_async__bad_field(self, mock_warn):
     """An unknown field imediately gives zero results."""
-    actual = search_queries.single_field_query_async('zodiac', '=', 'leo')
+    actual = search_queries.single_field_query_async('zodiac', '=', ['leo'])
     self.assertCountEqual([], actual)
 
   def test_handle_me_query_async__owner_anon(self):
@@ -257,16 +352,18 @@ class SearchFeaturesTest(testing_config.CustomTestCase):
 
   def test_total_order_query_async__requested_on(self):
     """We can get feature IDs sorted by gate review requests."""
-    actual = search_queries.total_order_query_async('gate.requested_on')
+    future = search_queries.total_order_query_async('gate.requested_on')
+    actual = search._resolve_promise_to_id_list(future)
     self.assertEqual(
         [self.feature_2_id],
         actual)
 
   def test_total_order_query_async__reviewed_on(self):
     """We can get feature IDs sorted by gate resolution times."""
-    actual = search_queries.total_order_query_async('gate.reviewed_on')
+    future = search_queries.total_order_query_async('gate.reviewed_on')
+    actual = search._resolve_promise_to_id_list(future)
     self.assertEqual(
-        [self.feature_1_id],
+        [self.feature_1_id, self.feature_2_id],
         actual)
 
   def test_stage_fields_have_join_conditions(self):

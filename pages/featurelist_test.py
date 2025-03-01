@@ -23,7 +23,7 @@ import html5lib
 import settings
 
 from internals import core_enums
-from internals import core_models
+from internals.core_models import FeatureEntry
 from internals import user_models
 from pages import featurelist
 from framework import rediscache
@@ -47,18 +47,12 @@ class TestWithFeature(testing_config.CustomTestCase):
     self.app_admin.is_admin = True
     self.app_admin.put()
 
-    self.feature_1 = core_models.Feature(
-        name='feature one', summary='detailed sum', owner=['owner@example.com'],
-        category=1, intent_stage=core_enums.INTENT_IMPLEMENT)
-    self.feature_1.put()
-    self.feature_id = self.feature_1.key.integer_id()
-
-    self.fe_1 = core_models.FeatureEntry(
+    self.fe_1 = FeatureEntry(
         name='feature one', summary='detailed sum',
         owner_emails=['owner@example.com'],
         category=1, intent_stage=core_enums.INTENT_IMPLEMENT)
     self.fe_1.put()
-    self.fe_id = self.fe_1.key.integer_id()
+    self.feature_id = self.fe_1.key.integer_id()
 
     self.request_path = (self.REQUEST_PATH_FORMAT %
         {'feature_id': self.feature_id} if self.REQUEST_PATH_FORMAT else '')
@@ -66,7 +60,6 @@ class TestWithFeature(testing_config.CustomTestCase):
       self.handler = self.HANDLER_CLASS()
 
   def tearDown(self):
-    self.feature_1.key.delete()
     self.fe_1.key.delete()
     self.app_user.delete()
     self.app_admin.delete()
@@ -89,8 +82,6 @@ class FeaturesJsonHandlerTest(TestWithFeature):
 
   def test_get_template_data__unlisted_no_perms(self):
     """JSON feed does not include unlisted features for users who can't edit."""
-    self.feature_1.unlisted = True
-    self.feature_1.put()
     self.fe_1.unlisted = True
     self.fe_1.put()
 
@@ -106,8 +97,6 @@ class FeaturesJsonHandlerTest(TestWithFeature):
 
   def test_get_template_data__unlisted_can_edit(self):
     """JSON feed includes unlisted features for site editors and admins."""
-    self.feature_1.unlisted = True
-    self.feature_1.put()
 
     testing_config.sign_in('admin@example.com', 111)
     with test_app.test_request_context(self.request_path):

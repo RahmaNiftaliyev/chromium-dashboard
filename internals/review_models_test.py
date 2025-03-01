@@ -15,106 +15,17 @@
 import testing_config  # Must be imported before the module under test.
 
 import datetime
-from unittest import mock
-from framework import users
 
-from internals import approval_defs, core_models
-from internals.review_models import Activity, Approval, Gate, OwnersFile, Vote
+from internals.core_models import FeatureEntry
+from internals.review_models import Activity, Gate, OwnersFile, Vote
 
 
-class ApprovalTest(testing_config.CustomTestCase):
+class ActivityTest(testing_config.CustomTestCase):
 
   def setUp(self):
-    self.feature_1 = core_models.Feature(
-        name='feature a', summary='sum', category=1, impl_status_chrome=3)
-    self.feature_1.put()
-    self.feature_1_id = self.feature_1.key.integer_id()
-    self.appr_1 = Approval(
-        feature_id=self.feature_1_id, field_id=1,
-        state=Approval.REVIEW_REQUESTED,
-        set_on=datetime.datetime.now() - datetime.timedelta(1),
-        set_by='one@example.com')
-    self.appr_1.put()
-
-    self.appr_2 = Approval(
-        feature_id=self.feature_1_id, field_id=1,
-        state=Approval.APPROVED,
-        set_on=datetime.datetime.now(),
-        set_by='two@example.com')
-    self.appr_2.put()
-    self.appr_3 = Approval(
-        feature_id=self.feature_1_id, field_id=1,
-        state=Approval.APPROVED,
-        set_on=datetime.datetime.now() + datetime.timedelta(1),
-        set_by='three@example.com')
-    self.appr_3.put()
-
-  def tearDown(self):
-    self.feature_1.key.delete()
-    for appr in Approval.query().fetch(None):
-      appr.key.delete()
-    for gate in Gate.query():
-      gate.key.delete()
-    for vote in Vote.query():
-      vote.key.delete()
-
-  def test_get_approvals(self):
-    """We can retrieve Approval entities."""
-    actual = Approval.get_approvals(feature_id=self.feature_1_id)
-    self.assertEqual(3, len(actual))
-    self.assertEqual(Approval.REVIEW_REQUESTED, actual[0].state)
-    self.assertEqual(Approval.APPROVED, actual[1].state)
-    self.assertEqual(
-        sorted(actual, key=lambda appr: appr.set_on),
-        actual)
-
-    actual = Approval.get_approvals(field_id=1)
-    self.assertEqual(Approval.REVIEW_REQUESTED, actual[0].state)
-    self.assertEqual(Approval.APPROVED, actual[1].state)
-
-    actual = Approval.get_approvals(
-        states={Approval.REVIEW_REQUESTED,
-                Approval.REVIEW_STARTED})
-    self.assertEqual(1, len(actual))
-
-    actual = Approval.get_approvals(set_by='one@example.com')
-    self.assertEqual(1, len(actual))
-    self.assertEqual(Approval.REVIEW_REQUESTED, actual[0].state)
-
-  def test_is_valid_state(self):
-    """We know what approval states are valid."""
-    self.assertTrue(
-        Approval.is_valid_state(Approval.REVIEW_REQUESTED))
-    self.assertFalse(Approval.is_valid_state(None))
-    self.assertFalse(Approval.is_valid_state('not an int'))
-    self.assertFalse(Approval.is_valid_state(999))
-
-  def test_set_approval(self):
-    """We can set an Approval entity."""
-    Approval.set_approval(
-        self.feature_1_id, 2, Approval.REVIEW_REQUESTED,
-        'owner@example.com')
-    self.assertEqual(
-        4,
-        len(Approval.query().fetch(None)))
-
-  def test_clear_request(self):
-    """We can clear a review request so that it is no longer pending."""
-    self.appr_1.state = Approval.REVIEW_REQUESTED
-    self.appr_1.put()
-
-    Approval.clear_request(self.feature_1_id, 1)
-
-    remaining_apprs = Approval.get_approvals(
-        feature_id=self.feature_1_id, field_id=1,
-        states=[Approval.REVIEW_REQUESTED])
-    self.assertEqual([], remaining_apprs)
-
-class CommentTest(testing_config.CustomTestCase):
-
-  def setUp(self):
-    self.feature_1 = core_models.Feature(
-        name='feature a', summary='sum',  owner=['feature_owner@example.com'],
+    self.feature_1 = FeatureEntry(
+        name='feature a', summary='sum',
+        owner_emails=['feature_owner@example.com'],
         category=1, impl_status_chrome=3)
     self.feature_1.put()
     self.feature_1_id = self.feature_1.key.integer_id()
@@ -134,8 +45,9 @@ class CommentTest(testing_config.CustomTestCase):
         content='random')
     self.act_1_3.put()
 
-    self.feature_2 = core_models.Feature(
-        name='feature b', summary='sum', owner=['feature_owner@example.com'],
+    self.feature_2 = FeatureEntry(
+        name='feature b', summary='sum',
+        owner_emails=['feature_owner@example.com'],
         category=1, impl_status_chrome=3)
     self.feature_2.put()
     self.feature_2_id = self.feature_2.key.integer_id()
@@ -160,28 +72,28 @@ class CommentTest(testing_config.CustomTestCase):
         [c.content for c in actual])
 
   def test_get_activities__specific_fields(self):
-    """We get review comments for specific approval fields if requested."""
+    """We get review comments for specific gates if requested."""
     actual_1 = Activity.get_activities(
         self.feature_1_id, 1, comments_only=True)
-    self.assertEqual(2, len(actual_1))
+    self.assertEqual(1, len(actual_1))
     self.assertEqual(
-        ['some text', 'random'],
+        ['some text'],
         [c.content for c in actual_1])
 
     actual_2 = Activity.get_activities(
         self.feature_1_id, 2, comments_only=True)
-    self.assertEqual(2, len(actual_2))
+    self.assertEqual(1, len(actual_2))
     self.assertEqual(
-        ['some other text', 'random'],
+        ['some other text'],
         [c.content for c in actual_2])
 
     actual_3 = Activity.get_activities(
         self.feature_1_id, 3, comments_only=True)
-    self.assertEqual('random', actual_3[0].content)
+    self.assertEqual([], actual_3)
 
 
 class GateTest(testing_config.CustomTestCase):
-  # TODO(jrobbins): Add tests for is_resolved, is_approved, get_feature_gates.
+  # TODO(jrobbins): Add tests for get_feature_gates.
   pass
 
 
@@ -201,8 +113,9 @@ class OwnersFileTest(testing_config.CustomTestCase):
     self.owner_file_2.key.delete()
 
   def test_get_raw_owner_file(self):
-    raw_content = OwnersFile.get_raw_owner_file('abc')
-    self.assertEqual('foo', raw_content)
+    owners_file = OwnersFile.get_raw_owner_file('abc')
+    self.assertEqual('foo', owners_file.raw_content)
+    self.assertTrue(owners_file.is_fresh())
 
-    expired_content = OwnersFile.get_raw_owner_file('def')
-    self.assertEqual(None, expired_content)
+    expired_owners_file = OwnersFile.get_raw_owner_file('def')
+    self.assertFalse(expired_owners_file.is_fresh())
